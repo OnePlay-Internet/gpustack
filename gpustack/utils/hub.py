@@ -668,12 +668,12 @@ def auth_check(
             api.auth_check(model.huggingface_repo_id)
         except GatedRepoError:
             raise Exception(
-                "Access to the model is restricted. Please set a valid Huggingface token with proper permissions in the GPUStack server configuration."
+                "Access to the model is restricted. Please set a valid Huggingface token with proper permissions in the Samaira AI server configuration."
             )
         except HfHubHTTPError as e:
             if e.response.status_code in [401, 403]:
                 raise Exception(
-                    "Access to the model is restricted. Please set a valid Huggingface token with proper permissions in the GPUStack server configuration."
+                    "Access to the model is restricted. Please set a valid Huggingface token with proper permissions in the Samaira AI server configuration."
                 )
     if model.source == SourceEnum.MODEL_SCOPE:
         api = HubApi()

@@ -236,7 +236,7 @@ class Worker:
         Start the worker.
         """
 
-        logger.info("Starting GPUStack worker.")
+        logger.info("Starting Samaira AI worker.")
 
         add_signal_handlers_in_loop()
 
@@ -325,7 +325,7 @@ class Worker:
 
         # wait for a while to let other tasks start
         await asyncio.sleep(0.5)
-        logger.info("GPUStack worker startup completed.")
+        logger.info("Samaira AI worker startup completed.")
 
         await asyncio.gather(*self._async_tasks)
 
@@ -352,7 +352,7 @@ class Worker:
                 await kube_session.close()
 
         app = FastAPI(
-            title="GPUStack Worker",
+            title="Samaira AI Worker",
             response_model_exclude_unset=True,
             lifespan=lifespan,
         )

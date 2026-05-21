@@ -319,14 +319,14 @@ async def validate_model_in(
                 ["port"],
                 (
                     "Setting the port using --port is not supported. Ports are "
-                    "automatically allocated by GPUStack."
+                    "automatically allocated by Samaira AI."
                 ),
             ),
             (
                 ["api-key"],
                 (
                     "Setting the API key using --api-key is not supported. API keys "
-                    "are managed by GPUStack."
+                    "are managed by Samaira AI."
                 ),
             ),
             (

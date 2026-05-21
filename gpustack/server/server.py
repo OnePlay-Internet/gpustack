@@ -127,7 +127,7 @@ class Server:
         return self._config
 
     async def start(self):
-        logger.info("Starting GPUStack server.")
+        logger.info("Starting Samaira AI server.")
 
         add_signal_handlers_in_loop()
 
@@ -186,15 +186,15 @@ class Server:
 
         setup_logging()
         logger.info(f"Gateway mode: {self._config.gateway_mode.value}.")
-        serving_api_message = f"Serving GPUStack API on {config.host}:{config.port}."
+        serving_api_message = f"Serving Samaira AI API on {config.host}:{config.port}."
         if self._config.gateway_mode == GatewayModeEnum.embedded:
             logger.debug(serving_api_message)
             logger.info(
-                f"GPUStack Server will serve on 0.0.0.0:{self._config.get_gateway_port()}."
+                f"Samaira AI Server will serve on 0.0.0.0:{self._config.get_gateway_port()}."
             )
             if self._config.get_tls_secret_name() is not None:
                 logger.info(
-                    f"GPUStack Server will serve TLS on 0.0.0.0:{self._config.tls_port}."
+                    f"Samaira AI Server will serve TLS on 0.0.0.0:{self._config.tls_port}."
                 )
         else:
             logger.info(serving_api_message)
@@ -396,10 +396,10 @@ class Server:
         ports = [self._config.port]
         if self._config.get_tls_secret_name() is not None:
             ports.append(self._config.tls_port)
-        logger.info(f"Waiting for ports {ports} of GPUStack to be ready...")
+        logger.info(f"Waiting for ports {ports} of Samaira AI to be ready...")
         # wait for gateway ready for about 60s
         await self._check_ports_ready(*ports)
-        logger.info("GPUStack Server is ready.")
+        logger.info("Samaira AI Server is ready.")
 
     @tenacity.retry(
         stop=tenacity.stop_after_attempt(GATEWAY_PORT_CHECK_RETRY_COUNT),
@@ -800,7 +800,7 @@ class Server:
         hashed_suffix = secrets.token_hex(6)
         default_cluster = Cluster(
             name="Default Cluster",
-            description="The default cluster for GPUStack",
+            description="The default cluster for Samaira AI",
             provider=provider,
             state=ClusterStateEnum.READY,
             hashed_suffix=hashed_suffix,

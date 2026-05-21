@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 def setup_prerun_cmd(subparsers: argparse._SubParsersAction):
     parser_server: argparse.ArgumentParser = subparsers.add_parser(
         "prerun",
-        description="Perform pre-run checks and setup s6-overlay configuration for GPUStack.",
+        description="Perform pre-run checks and setup s6-overlay configuration for Samaira AI.",
     )
     # following args are hidden and used for debugging or advanced usage
     parser_server.add_argument(
@@ -50,7 +50,7 @@ def run(args: argparse.Namespace):
         cfg = parse_args(args)
         setup_logging(cfg.debug)
         logger.info(
-            "Starting pre-run checks and setup s6-overlay configuration for GPUStack..."
+            "Starting pre-run checks and setup s6-overlay configuration for Samaira AI..."
         )
         s6_base_path = args.s6_base_path or "/etc/s6-overlay/s6-rc.d"
         enabled_services = determine_enabled_services(cfg)
@@ -58,10 +58,10 @@ def run(args: argparse.Namespace):
         migrate_hardcode_postgres_data_and_password(cfg, enabled_services)
         dependency_services = determine_dependency_services(cfg)
         if len(dependency_services) == 0 and len(enabled_services) == 0:
-            logger.info("No extra s6 services for gpustack to enable.")
+            logger.info("No extra s6 services for Samaira AI to enable.")
         else:
             logger.info(
-                f"Enabled s6 services: {enabled_services}, dependencies for gpustack: {dependency_services}"
+                f"Enabled s6 services: {enabled_services}, dependencies for Samaira AI: {dependency_services}"
             )
         prepare_s6_overlay(enabled_services, dependency_services, Path(s6_base_path))
 
@@ -136,8 +136,8 @@ def check_ports_availability(cfg: Config, *services: str):
 
 def reserve_ports_against_ephemeral(cfg: Config):
     """
-    Reserve gpustack's service and Ray port ranges against the kernel's
-    ephemeral port range so outbound connections (by gpustack, higress, or
+    Reserve Samaira AI's service and Ray port ranges against the kernel's
+    ephemeral port range so outbound connections (by Samaira AI, higress, or
     any other sibling process sharing the netns) don't transiently squat on
     ports that Ray or inference servers will later bind().
 
@@ -276,7 +276,7 @@ def prepare_observability_config(cfg: Config):
     )
     prometheus_config_path.parent.mkdir(parents=True, exist_ok=True)
     prometheus_config_path.write_text(
-        f"""# Managed by GPUStack
+        f"""# Managed by Samaira AI
 global:
   scrape_interval: 15s
   scrape_timeout: 10s

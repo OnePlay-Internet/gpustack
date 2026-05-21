@@ -40,7 +40,7 @@ def create_app(cfg: Config) -> FastAPI:
         await app.state.http_client_no_proxy.close()
 
     app = FastAPI(
-        title="GPUStack",
+        title="Samaira AI",
         lifespan=lifespan,
         response_model_exclude_unset=True,
         version=__version__,

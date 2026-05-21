@@ -39,7 +39,7 @@ def setup_reset_admin_password_cmd(subparsers: argparse._SubParsersAction):
         "-d",
         "--data-dir",
         type=str,
-        help="Directory of the local gpustack data dir. Used to read the JWT "
+        help="Directory of the local Samaira AI data dir. Used to read the JWT "
         "secret when --api-key is not provided.",
         default=get_gpustack_env("DATA_DIR"),
     )
@@ -81,7 +81,7 @@ def run(args):
                     break
             if server_url is None:
                 raise Exception(
-                    "Cannot connect to local gpustack server. Please specify --server-url"
+                    "Cannot connect to local Samaira AI server. Please specify --server-url"
                 )
 
         api_key = args.api_key
@@ -136,7 +136,7 @@ def _resolve_jwt_secret(args) -> str:
     jwt_secret_path = os.path.join(data_dir, "jwt_secret_key")
     if not os.path.exists(jwt_secret_path):
         raise Exception(
-            "Cannot authenticate to the local gpustack server. "
+            "Cannot authenticate to the local Samaira AI server. "
             f"JWT secret file not found at {jwt_secret_path}. "
             "Please provide --api-key, --jwt-secret-key, or "
             "GPUSTACK_JWT_SECRET_KEY; alternatively run this command on the "
@@ -147,7 +147,7 @@ def _resolve_jwt_secret(args) -> str:
     if not secret:
         raise Exception(
             f"JWT secret file at {jwt_secret_path} is empty. "
-            "Please verify the gpustack server data directory."
+            "Please verify the Samaira AI server data directory."
         )
     return secret
 

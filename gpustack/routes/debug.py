@@ -35,7 +35,7 @@ async def set_log_level(request: Request):
 def get_memory_profile():
     if not tracemalloc.is_tracing():
         raise BadRequestException(
-            message="tracemalloc is not enabled. Please run GPUStack server in debug mode."
+            message="tracemalloc is not enabled. Please run Samaira AI server in debug mode."
         )
 
     snapshot = tracemalloc.take_snapshot()

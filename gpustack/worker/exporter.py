@@ -343,7 +343,7 @@ class MetricExporter(Collector):
 
             # Start FastAPI server
             app = FastAPI(
-                title="GPUStack Worker Metrics Exporter",
+                title="Samaira AI Worker Metrics Exporter",
                 response_model_exclude_unset=True,
             )
 

@@ -36,8 +36,8 @@ class OptionalBoolAction(argparse.Action):
 def setup_reload_config_cmd(subparsers: argparse._SubParsersAction):
     parser: argparse.ArgumentParser = subparsers.add_parser(
         "reload-config",
-        help="Reload GPUStack configuration.",
-        description=("Reload GPUStack configuration via --set, --file, or --list."),
+        help="Reload Samaira AI configuration.",
+        description=("Reload Samaira AI configuration via --set, --file, or --list."),
     )
 
     parser.add_argument(
@@ -77,13 +77,13 @@ def setup_reload_config_cmd(subparsers: argparse._SubParsersAction):
     parser.add_argument(
         "--server-port",
         type=int,
-        help="Port of the GPUStack API server to target.",
+        help="Port of the Samaira AI API server to target.",
         default=get_gpustack_env("API_PORT"),
     )
     parser.add_argument(
         "--worker-port",
         type=int,
-        help="Port of the GPUStack worker to target.",
+        help="Port of the Samaira AI worker to target.",
         default=get_gpustack_env("WORKER_PORT"),
     )
 
@@ -93,7 +93,7 @@ def setup_reload_config_cmd(subparsers: argparse._SubParsersAction):
 def run(args):
     try:
         logger.info("Starting configuration reload...")
-        logger.info(f"GPUStack version: {__version__} ({__git_commit__})")
+        logger.info(f"Samaira AI version: {__version__} ({__git_commit__})")
         if handle_list_mode(args):
             return
 

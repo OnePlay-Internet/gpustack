@@ -39,8 +39,8 @@ class OptionalBoolAction(argparse.Action):
 def setup_start_cmd(subparsers: argparse._SubParsersAction):
     parser_server: argparse.ArgumentParser = subparsers.add_parser(
         "start",
-        help="Run GPUStack server or worker.",
-        description="Run GPUStack server or worker.",
+        help="Run Samaira AI server or worker.",
+        description="Run Samaira AI server or worker.",
     )
     start_cmd_options(parser_server)
 
@@ -68,7 +68,7 @@ def start_cmd_options(parser_server: argparse.ArgumentParser):
     common_group.add_argument(
         "--api-port",
         type=int,
-        help="Port to bind the GPUStack API server to.",
+        help="Port to bind the Samaira AI API server to.",
         default=get_gpustack_env("API_PORT"),
     )
     common_group.add_argument(
@@ -123,25 +123,25 @@ def start_cmd_options(parser_server: argparse.ArgumentParser):
     common_group.add_argument(
         "--system-default-container-registry",
         type=str,
-        help="Default container registry for GPUStack to pull system and inference images. The default is 'docker.io'.",
+        help="Default container registry for Samaira AI to pull system and inference images. The default is 'docker.io'.",
         default=get_gpustack_env("SYSTEM_DEFAULT_CONTAINER_REGISTRY"),
     )
     common_group.add_argument(
         "--image-name-override",
         type=str,
-        help="Override the default image name for the GPUStack container.",
+        help="Override the default image name for the Samaira AI container.",
         default=get_gpustack_env("IMAGE_NAME_OVERRIDE"),
     )
     common_group.add_argument(
         "--image-repo",
         type=str,
-        help="Override the default image repository gpustack/gpustack for the GPUStack container.",
+        help="Override the default image repository gpustack/gpustack for the Samaira AI container.",
         default=get_gpustack_env("IMAGE_REPO"),
     )
     common_group.add_argument(
         "--benchmark-image-repo",
         type=str,
-        help="Override the default benchmark image repository gpustack/benchmark-runner for the GPUStack benchmark container.",
+        help="Override the default benchmark image repository gpustack/benchmark-runner for the Samaira AI benchmark container.",
         default=get_gpustack_env("BENCHMARK_IMAGE_REPO"),
     )
     common_group.add_argument(
@@ -171,7 +171,7 @@ def start_cmd_options(parser_server: argparse.ArgumentParser):
     common_group.add_argument(
         "--namespace",
         type=str,
-        help="Kubernetes namespace for GPUStack to deploy gateway routing rules and model instances.",
+        help="Kubernetes namespace for Samaira AI to deploy gateway routing rules and model instances.",
         default=os.getenv("POD_NAMESPACE"),
     )
 
@@ -201,13 +201,13 @@ def start_cmd_options(parser_server: argparse.ArgumentParser):
     server_group.add_argument(
         "--disable-worker",
         action=OptionalBoolAction,
-        help="(DEPRECATED) Disable the embedded worker for the GPUStack server. New installations will not have the embedded worker by default. Use '--enable-worker' to enable the embedded worker if needed. If neither flag is set, for backward compatibility, the embedded worker will be enabled by default for legacy installations prior to v2.0.1.",
+        help="(DEPRECATED) Disable the embedded worker for the Samaira AI server. New installations will not have the embedded worker by default. Use '--enable-worker' to enable the embedded worker if needed. If neither flag is set, for backward compatibility, the embedded worker will be enabled by default for legacy installations prior to v2.0.1.",
         default=get_gpustack_env_bool("DISABLE_WORKER"),
     )
     server_group.add_argument(
         "--enable-worker",
         action=OptionalBoolAction,
-        help="Enable the embedded worker for the GPUStack server.",
+        help="Enable the embedded worker for the Samaira AI server.",
         default=get_gpustack_env_bool("ENABLE_WORKER"),
     )
 
@@ -672,7 +672,7 @@ def run(args: argparse.Namespace):
         initialize_gateway(cfg)
         multiprocessing.set_start_method('spawn')
 
-        logger.info(f"GPUStack version: {__version__} ({__git_commit__})")
+        logger.info(f"Samaira AI version: {__version__} ({__git_commit__})")
 
         if cfg.server_url:
             run_worker(cfg)
