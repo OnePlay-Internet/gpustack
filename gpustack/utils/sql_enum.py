@@ -26,6 +26,7 @@ def add_enum_values(
             conn.execute(
                 sa.text(f"ALTER TYPE {original_enum.name} ADD VALUE '{value}'")
             )
+        conn.execute(sa.text("COMMIT"))
     elif conn.dialect.name == 'mysql':
         add_mysql_enum_values(table_columns, *to_add_values)
 

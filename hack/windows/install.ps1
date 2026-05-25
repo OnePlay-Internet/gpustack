@@ -71,6 +71,17 @@ function Get-UI {
 
     Copy-Item -Path "$tmpUIPath/dist/*" -Destination $uiPath -Recurse
     Remove-Item -Recurse -Force $tmpUIPath -ErrorAction Ignore
+
+    GPUStack.Log.Info "applying branding replacement to UI assets"
+    $venvPython = Join-Path -Path $ROOT_DIR -ChildPath ".venv/Scripts/python.exe"
+    if (-not (Test-Path $venvPython)) {
+        $venvPython = Join-Path -Path $ROOT_DIR -ChildPath ".venv/bin/python.exe"
+    }
+    if (Test-Path $venvPython) {
+        & $venvPython "$ROOT_DIR/hack/replace_ui_strings.py"
+    } else {
+        python "$ROOT_DIR/hack/replace_ui_strings.py"
+    }
 }
 
 function DownloadWithRetries {

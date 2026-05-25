@@ -59,6 +59,13 @@ function download_ui() {
   cp -a "${tmp_ui_path}/ui/dist/." "${ui_path}"
 
   rm -rf "${tmp_ui_path}"
+
+  gpustack::log::info "applying branding replacement to UI assets"
+  if [[ -f "${ROOT_DIR}/.venv/bin/python" ]]; then
+    "${ROOT_DIR}/.venv/bin/python" "${ROOT_DIR}/hack/replace_ui_strings.py"
+  else
+    python3 "${ROOT_DIR}/hack/replace_ui_strings.py" || python "${ROOT_DIR}/hack/replace_ui_strings.py"
+  fi
 }
 
 # Copy extra static files to ui including catalog icons

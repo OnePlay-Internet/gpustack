@@ -1,0 +1,75 @@
+# ==============================================================================
+# Samaira AI (GPUStack) Manual Deployment Configuration File
+# ==============================================================================
+# Usage:
+#   python gpustack/main.py start --config-file ./config.yaml
+#   Or set env var: GPUSTACK_CONFIG_FILE="./config.yaml"
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. Server Core Configuration
+# ------------------------------------------------------------------------------
+# Directory to store all runtime files, model weight downloads, and state.
+data_dir: "./data"
+
+# Port to bind the internal API server to.
+api_port: 8080
+
+# Port to bind the public-facing HTTP/HTTPS gateway (routing layer).
+# If gateway_mode is "disabled", these ports won't bind.
+port: 80
+tls_port: 443
+
+# Gateway mode: Options: "auto", "embedded", "incluster", "external", "disabled"
+# Set to "disabled" to skip launching the embedded Higress ingress gateway.
+gateway_mode: "disabled"
+
+# Whether to enable the embedded worker on this server instance.
+# For standalone local setups, set to true. For backend-only servers, set to false.
+enable_worker: true
+
+# Initial password for the admin account (only used on the first initialization).
+bootstrap_password: "admin_temp_password_123"
+
+# ------------------------------------------------------------------------------
+# 2. Database Configuration (SQL)
+# ------------------------------------------------------------------------------
+# Connection string for the database.
+# SQLite (default): Leave commented or unset.
+# PostgreSQL: "postgresql://username:password@hostname:5432/database_name"
+# MySQL: "mysql://username:password@hostname:3306/database_name"
+database_url: "postgresql://postgres:postgres@127.0.0.1:5432/gpustack?sslmode=disable"
+
+# Database server port.
+database_port: 5432
+
+# Database connection pool settings.
+# db_echo: false
+# db_pool_size: 30
+# db_max_overflow: 20
+# db_pool_timeout: 30
+
+# ------------------------------------------------------------------------------
+# 3. Observability & Monitoring (Grafana / Prometheus)
+# ------------------------------------------------------------------------------
+# Whether to disable the embedded Prometheus and Grafana instances.
+# Set to true if you are hosting your own monitoring stacks or want to save resources.
+disable_builtin_observability: false
+
+# Custom port configuration for the embedded metrics services.
+builtin_prometheus_port: 19090
+builtin_grafana_port: 13000
+
+# To route dashboards to your own external Grafana instance, provide its URL here:
+# (Note: Setting this automatically disables the embedded Prometheus and Grafana).
+# grafana_url: "https://grafana.example.com"
+# grafana_worker_dashboard_uid: "gpustack-worker"
+# grafana_model_dashboard_uid: "gpustack-model"
+
+# ------------------------------------------------------------------------------
+# 4. Third-Party Integrations
+# ------------------------------------------------------------------------------
+# Hugging Face User Access Token to download restricted models/repos.
+# huggingface_token: "hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# ==============================================================================
