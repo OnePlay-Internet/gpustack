@@ -1,10 +1,12 @@
 import asyncio
 import logging
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timezone, tzinfo
 from typing import Dict, List, Optional, Set, Tuple
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel
+from sqlmodel import or_
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from gpustack import envs
@@ -32,7 +34,9 @@ FLUSH_INTERVAL_SECONDS = 10
 #   "{model_id}.{provider_id}.{model}.{user_id}.{access_key}.{operation}.{date}"
 # ``operation`` and ``date`` are part of the key so per-operation rollups
 # stay separate and a stream that crosses midnight lands in the period
-# it ends in (anchored on completed_at).
+# it ends in (anchored on completed_at). ``date`` is computed in the
+# configured rollup timezone (see ``_resolve_rollup_tz``), not UTC, so
+# midnight here means local-calendar midnight.
 gateway_metrics_buffer: Dict[str, "ModelUsageMetrics"] = {}
 # Raw per-report metrics retained for ``model_usage_details`` audit rows.
 # Unlike ``gateway_metrics_buffer``, entries are not aggregated.
@@ -103,6 +107,33 @@ def _unixmilli_to_naive_utc(ms: Optional[int]) -> Optional[datetime]:
     return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc).replace(tzinfo=None)
 
 
+def _resolve_rollup_tz() -> tzinfo:
+    """Resolve the timezone used to bucket the daily ``model_usages.date`` rollup.
+
+    Priority:
+      1. ``GPUSTACK_USAGE_ROLLUP_TIMEZONE`` env (IANA name, e.g. ``Asia/Shanghai``).
+      2. Operating system local timezone (``TZ`` env / ``/etc/localtime``).
+    Falls back to UTC if the OS lookup somehow yields no tzinfo.
+    """
+    tz_name = envs.USAGE_ROLLUP_TIMEZONE
+    if tz_name:
+        try:
+            return ZoneInfo(tz_name)
+        except (ZoneInfoNotFoundError, ValueError):
+            # ``ValueError`` covers malformed keys (absolute paths, ``..``
+            # segments) that ``ZoneInfo`` rejects before lookup.
+            logger.warning(
+                "Invalid GPUSTACK_USAGE_ROLLUP_TIMEZONE=%r, falling back to OS local tz",
+                tz_name,
+            )
+    return datetime.now(timezone.utc).astimezone().tzinfo or timezone.utc
+
+
+# Resolved once at import time. Tests can monkeypatch this attribute to pin
+# a deterministic timezone independent of the host's ``TZ``.
+_ROLLUP_TZ: tzinfo = _resolve_rollup_tz()
+
+
 def _resolve_metric_datetime(
     metric: ModelUsageMetrics,
 ) -> Tuple[date, datetime]:
@@ -111,19 +142,30 @@ def _resolve_metric_datetime(
     Prefers ``completed_at`` so a stream that crosses a calendar boundary
     lands in the period it ends in (per the proxy contract). Falls back to
     ``started_at`` and finally to server ``now`` if both are absent.
+
+    The returned ``date`` is bucketed in ``_ROLLUP_TZ`` — **not** UTC — so a
+    request completing at e.g. ``2026-05-27T16:30Z`` (= ``2026-05-28 00:30``
+    in Asia/Shanghai) lands in the May-28 bucket instead of being attributed
+    to the previous UTC day. The returned ``datetime`` stays naive UTC so
+    downstream audit / lifecycle stamps keep matching ``UTCDateTime``.
     """
     dt = (
         _unixmilli_to_naive_utc(metric.completed_at)
         or _unixmilli_to_naive_utc(metric.started_at)
         or datetime.now(timezone.utc).replace(tzinfo=None)
     )
-    return dt.date(), dt
+    bucket_date = dt.replace(tzinfo=timezone.utc).astimezone(_ROLLUP_TZ).date()
+    return bucket_date, dt
 
 
 def _make_buffer_key(metric: ModelUsageMetrics) -> str:
     # Include the completion-anchored date so streams that cross midnight
     # accumulate into the correct billing-period rollup instead of being
-    # merged with the next day's traffic.
+    # merged with the next day's traffic. ``organization_id`` is included
+    # to match the DB upsert key in ``create_or_update_model_usage`` —
+    # otherwise the same user calling from different Org contexts within
+    # one flush window would merge in memory but split on write, losing
+    # tokens.
     metric_date, _ = _resolve_metric_datetime(metric)
     operation = metric.operation.value if metric.operation else ""
     return ".".join(
@@ -134,6 +176,7 @@ def _make_buffer_key(metric: ModelUsageMetrics) -> str:
             metric.model,
             metric.user_id,
             metric.access_key,
+            metric.organization_id,
             metric.model_route_id,
             operation,
             metric_date.isoformat(),
@@ -324,6 +367,7 @@ async def create_or_update_model_usage(
             "model_route_id": metric.model_route_id,
             "access_key": metric.access_key,
             "operation": metric.operation,
+            "consumer_principal_id": metric.consumer_principal_id,
             "date": metric.date,
         },
     )
@@ -349,6 +393,8 @@ def _validate_usage_metric(
     models: Dict[int, Model],
     providers: Dict[int, ModelProvider],
     user_ids: Set[int],
+    route_name_by_id: Dict[int, str],
+    route_base_model_id_by_id: Dict[int, int],
 ) -> bool:
     if metric.model_id is None and metric.provider_id is None:
         logger.debug(
@@ -361,10 +407,24 @@ def _validate_usage_metric(
             logger.debug(f"Model ID {metric.model_id} not found in database.")
             return False
         if model.name != metric.model:
-            logger.debug(
-                f"Model name {metric.model} does not match database record {model.name} for model ID {metric.model_id}."
-            )
-            return False
+            # LoRA requests carry the LoRA route name (e.g. "base:adapter") in
+            # `metric.model` since LoRA entries are expanded into ModelRoute
+            # names by `lora_route_name_for` and there is no standalone Model
+            # row. Accept the mismatch when model_route_id binds to a route
+            # whose name == metric.model and whose created_model_id == base.
+            route_id = metric.model_route_id
+            if (
+                route_id is None
+                or route_name_by_id.get(route_id) != metric.model
+                or route_base_model_id_by_id.get(route_id) != metric.model_id
+            ):
+                logger.debug(
+                    f"Dropping usage metric: model={metric.model!r} does not "
+                    f"match base model name {model.name!r} "
+                    f"(model_id={metric.model_id}) and no matching LoRA route "
+                    f"is bound (model_route_id={route_id})."
+                )
+                return False
     if metric.provider_id is not None:
         provider = providers.get(metric.provider_id)
         if not provider:
@@ -432,6 +492,7 @@ def _build_metric_snapshot(
                     "api_key_name": api_key.name,
                     "access_key": api_key.access_key,
                     "api_key_is_custom": api_key.is_custom,
+                    "consumer_principal_id": api_key.owner_principal_id,
                 }
             )
         if model_route_id is not None:
@@ -463,6 +524,19 @@ def _build_metric_snapshot(
     snapshot.setdefault("provider_type", metric.provider_type)
     snapshot.setdefault("access_key", metric.access_key)
     snapshot.setdefault("api_key_is_custom", None)
+    # The api_key path above stamps ``consumer_principal_id`` from
+    # ``api_key.owner_principal_id`` whenever a key is present. For
+    # cookie-authed traffic (no api_key) the gateway plugin still
+    # provides the active tenant via the wire-format
+    # ``organization_id`` header — parse it back to int so the row
+    # carries its Org scope. Direct-to-gpustack cookie calls don't
+    # populate this field and land NULL; that's by design (no Org
+    # context known at that path).
+    if "consumer_principal_id" not in snapshot and metric.organization_id:
+        try:
+            snapshot["consumer_principal_id"] = int(metric.organization_id)
+        except (TypeError, ValueError):
+            pass
     return snapshot
 
 
@@ -476,6 +550,7 @@ async def store_usage_metrics(
 
     all_metrics = list(metrics) + detail_metrics
     dedup_model_names = {m.model for m in all_metrics}
+    dedup_model_ids = {m.model_id for m in all_metrics if m.model_id is not None}
     dedup_user_ids = {m.user_id for m in all_metrics if m.user_id is not None}
     dedup_access_keys = {m.access_key for m in all_metrics if m.access_key is not None}
     dedup_provider_ids = {
@@ -486,10 +561,18 @@ async def store_usage_metrics(
     }
     async with async_session() as session:
         try:
+            # Load models by name OR id. LoRA requests carry the LoRA route
+            # name in `metric.model` (no Model row by that name), so the base
+            # model can only be reached via `metric.model_id`.
+            model_conditions = []
+            if dedup_model_names:
+                model_conditions.append(Model.name.in_(dedup_model_names))
+            if dedup_model_ids:
+                model_conditions.append(Model.id.in_(dedup_model_ids))
             models = await Model.all_by_fields(
                 session=session,
                 fields={},
-                extra_conditions=[Model.name.in_(dedup_model_names)],
+                extra_conditions=[or_(*model_conditions)] if model_conditions else [],
             )
             providers = await ModelProvider.all_by_fields(
                 session=session,
@@ -519,6 +602,7 @@ async def store_usage_metrics(
                 ),
             )
             route_name_by_id: Dict[int, str] = {}
+            route_base_model_id_by_id: Dict[int, int] = {}
             if dedup_route_ids:
                 routes = await ModelRoute.all_by_fields(
                     session=session,
@@ -526,6 +610,11 @@ async def store_usage_metrics(
                     extra_conditions=[ModelRoute.id.in_(dedup_route_ids)],
                 )
                 route_name_by_id = {r.id: r.name for r in routes}
+                route_base_model_id_by_id = {
+                    r.id: r.created_model_id
+                    for r in routes
+                    if r.created_model_id is not None
+                }
             validated_user_ids = {u.id for u in users}
             user_by_id = {u.id: u for u in users}
             api_key_by_access_key = {k.access_key: k for k in api_keys}
@@ -541,7 +630,12 @@ async def store_usage_metrics(
 
             for metric in metrics:
                 if not _validate_usage_metric(
-                    metric, model_by_id, provider_by_id, validated_user_ids
+                    metric,
+                    model_by_id,
+                    provider_by_id,
+                    validated_user_ids,
+                    route_name_by_id,
+                    route_base_model_id_by_id,
                 ):
                     continue
                 snapshot = _build_metric_snapshot(
@@ -572,7 +666,12 @@ async def store_usage_metrics(
 
             for metric in detail_metrics:
                 if not _validate_usage_metric(
-                    metric, model_by_id, provider_by_id, validated_user_ids
+                    metric,
+                    model_by_id,
+                    provider_by_id,
+                    validated_user_ids,
+                    route_name_by_id,
+                    route_base_model_id_by_id,
                 ):
                     continue
                 snapshot = _build_metric_snapshot(

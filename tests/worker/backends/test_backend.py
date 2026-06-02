@@ -1,3 +1,4 @@
+import json
 import types
 
 import pytest
@@ -10,14 +11,18 @@ from gpustack.schemas.inference_backend import (
 )
 from gpustack.schemas.models import BackendEnum
 from gpustack.utils.config import apply_registry_override_to_image
+from gpustack.worker.backends.base import InferenceServer, read_lora_max_rank
 from gpustack.worker.backends.custom import CustomServer
 from gpustack.worker.backends.sglang import (
     SGLangServer,
+    extend_sglang_mounted_lora_arguments,
     get_access_log_arguments as get_sglang_access_log_arguments,
     get_cache_report_arguments as get_sglang_cache_report_arguments,
 )
 from gpustack.worker.backends.vllm import (
     VLLMServer,
+    extend_vllm_mounted_lora_arguments,
+    _round_up_vllm_lora_rank,
     get_access_log_arguments as get_vllm_access_log_arguments,
     get_cache_report_arguments as get_vllm_cache_report_arguments,
 )
@@ -755,3 +760,205 @@ def test_custom_backend_configured_entrypoint_injected_parameters(
     assert entrypoint == expected_entrypoint
     assert arguments[-2:] == ["--user-param", "1"]
     assert injected == expected_injected
+
+
+@pytest.mark.parametrize(
+    "command, command_args, command_script, expected_command, expected_args",
+    [
+        # No script + non-empty command (vLLM/SGLang main path): merge into
+        # command so the image ENTRYPOINT is fully overridden.
+        (
+            ["vllm", "serve"],
+            ["/models/llm", "--port", "8000"],
+            None,
+            ["vllm", "serve", "/models/llm", "--port", "8000"],
+            None,
+        ),
+        # No script + command is None (vox_box/ascend with no entrypoint):
+        # keep args as-is, must not raise TypeError on None + list.
+        (
+            None,
+            ["vox-box", "start", "--model", "/models/audio"],
+            None,
+            None,
+            ["vox-box", "start", "--model", "/models/audio"],
+        ),
+        # No script + empty command: same as None.
+        ([], ["mindieservice_daemon"], None, None, ["mindieservice_daemon"]),
+        # Script + non-empty command: script becomes entrypoint, command is
+        # prepended to its args.
+        (
+            ["vllm", "serve"],
+            ["/models/llm"],
+            "setup.sh",
+            None,
+            ["vllm", "serve", "/models/llm"],
+        ),
+        # Script + command is None: just pass the args through under the script.
+        (None, ["vox-box", "start"], "setup.sh", None, ["vox-box", "start"]),
+    ],
+)
+def test_override_entrypoint(
+    command, command_args, command_script, expected_command, expected_args
+):
+    result_command, result_args = InferenceServer._override_entrypoint(
+        command, command_args, command_script
+    )
+
+    assert result_command == expected_command
+    assert result_args == expected_args
+
+
+@pytest.mark.parametrize(
+    "arguments, entrypoint, expected_start_index",
+    [
+        # Empty arguments.
+        ([], None, 0),
+        # vLLM/SGLang style: executable carried in command (not args here),
+        # first option marks the start.
+        (["vllm", "serve", "/models/llm", "--port", "8000"], None, 3),
+        # python -m module ...: skip the launcher and module, start at 3.
+        (["python", "-m", "vllm", "--host", "x"], None, 3),
+        # With an explicit container entrypoint, the python -m heuristic is
+        # skipped; the first dash-prefixed token wins ("-m" at index 1).
+        (["python", "-m", "vllm", "--host", "x"], ["llama-server"], 1),
+        # Entrypoint set, model path then first option.
+        (["/models/llm", "--port", "8000"], ["vllm", "serve"], 1),
+        # First token already an option.
+        (["--port", "8000"], None, 0),
+    ],
+)
+def test_get_backend_parameter_start_index(arguments, entrypoint, expected_start_index):
+    assert (
+        InferenceServer._get_backend_parameter_start_index(arguments, entrypoint)
+        == expected_start_index
+    )
+
+
+def _write_adapter_config(path, data) -> str:
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "adapter_config.json").write_text(json.dumps(data), encoding="utf-8")
+    return str(path)
+
+
+def _lora(lora_name, path):
+    return types.SimpleNamespace(lora_name=lora_name, path=path)
+
+
+def _arg_value(arguments, key):
+    """Return the value following ``key`` in a flat argument list."""
+    for i, token in enumerate(arguments):
+        if token == key:
+            return arguments[i + 1]
+        if token.startswith(f"{key}="):
+            return token.split("=", 1)[1]
+    return None
+
+
+def test_read_lora_max_rank_basic(tmp_path):
+    adapter = _write_adapter_config(tmp_path / "a", {"r": 64})
+    assert read_lora_max_rank([adapter]) == 64
+
+
+def test_read_lora_max_rank_prefers_rank_pattern(tmp_path):
+    adapter = _write_adapter_config(
+        tmp_path / "a", {"r": 16, "rank_pattern": {"layers.0.attn": 128}}
+    )
+    assert read_lora_max_rank([adapter]) == 128
+
+
+def test_read_lora_max_rank_across_multiple_adapters(tmp_path):
+    a = _write_adapter_config(tmp_path / "a", {"r": 16})
+    b = _write_adapter_config(tmp_path / "b", {"r": 64})
+    assert read_lora_max_rank([a, b]) == 64
+
+
+def test_read_lora_max_rank_missing_or_broken_returns_none(tmp_path):
+    missing = str(tmp_path / "missing")
+    broken = tmp_path / "broken"
+    broken.mkdir()
+    (broken / "adapter_config.json").write_text("{not json", encoding="utf-8")
+    no_rank = _write_adapter_config(tmp_path / "no_rank", {"base_model_name": "x"})
+    assert read_lora_max_rank([missing, str(broken), no_rank]) is None
+    assert read_lora_max_rank([None, ""]) is None
+
+
+def test_vllm_injects_max_lora_rank(tmp_path):
+    adapter = _write_adapter_config(tmp_path / "a", {"r": 64})
+    arguments = []
+    extend_vllm_mounted_lora_arguments(
+        arguments,
+        [_lora("base:a", adapter)],
+        "base",
+        backend_parameters=None,
+    )
+    assert _arg_value(arguments, "--max-lora-rank") == "64"
+
+
+def test_vllm_rounds_up_to_allowed_choice(tmp_path):
+    adapter = _write_adapter_config(tmp_path / "a", {"r": 24})
+    arguments = []
+    extend_vllm_mounted_lora_arguments(
+        arguments,
+        [_lora("base:a", adapter)],
+        "base",
+        backend_parameters=None,
+    )
+    assert _arg_value(arguments, "--max-lora-rank") == "32"
+
+
+def test_vllm_respects_user_max_lora_rank(tmp_path):
+    adapter = _write_adapter_config(tmp_path / "a", {"r": 64})
+    arguments = []
+    extend_vllm_mounted_lora_arguments(
+        arguments,
+        [_lora("base:a", adapter)],
+        "base",
+        backend_parameters=["--max-lora-rank", "128"],
+    )
+    # User value lives in backend_parameters and is appended later; we must not
+    # inject our own into arguments.
+    assert "--max-lora-rank" not in arguments
+
+
+def test_vllm_skips_when_rank_unreadable(tmp_path):
+    adapter = _write_adapter_config(tmp_path / "a", {"base_model_name": "base"})
+    arguments = []
+    extend_vllm_mounted_lora_arguments(
+        arguments,
+        [_lora("base:a", adapter)],
+        "base",
+        backend_parameters=None,
+    )
+    assert "--max-lora-rank" not in arguments
+
+
+def test_sglang_injects_raw_max_lora_rank(tmp_path):
+    # SGLang has no fixed choice set: the raw max rank is used as-is.
+    adapter = _write_adapter_config(tmp_path / "a", {"r": 24})
+    arguments = []
+    extend_sglang_mounted_lora_arguments(
+        arguments,
+        [_lora("base:a", adapter)],
+        backend_parameters=None,
+    )
+    assert _arg_value(arguments, "--max-lora-rank") == "24"
+
+
+def test_sglang_respects_user_max_lora_rank(tmp_path):
+    adapter = _write_adapter_config(tmp_path / "a", {"r": 64})
+    arguments = []
+    extend_sglang_mounted_lora_arguments(
+        arguments,
+        [_lora("base:a", adapter)],
+        backend_parameters=["--max-lora-rank", "128"],
+    )
+    assert "--max-lora-rank" not in arguments
+
+
+def test_round_up_vllm_lora_rank():
+    assert _round_up_vllm_lora_rank(8) == 8
+    assert _round_up_vllm_lora_rank(24) == 32
+    assert _round_up_vllm_lora_rank(64) == 64
+    assert _round_up_vllm_lora_rank(200) == 256
+    assert _round_up_vllm_lora_rank(1024) == 1024  # beyond known set: pass through

@@ -19,7 +19,6 @@ from gpustack.routes import (
     model_evaluations,
     model_files,
     model_instances,
-    model_route_principals,
     model_sets,
     organization_members,
     organizations,
@@ -43,6 +42,10 @@ from gpustack.routes import (
     model_routes,
     grafana,
     prometheus,
+    gpu_instance_persistent_volume_types,
+    gpu_instance_persistent_volumes,
+    gpu_instance_types,
+    gpu_instances,
 )
 
 from gpustack.api.exceptions import error_responses, openai_api_error_responses
@@ -60,7 +63,6 @@ from gpustack.routes.gateway_metrics import router as gateway_metrics_router
 from gpustack_higress_plugins.server import router as higress_plugins_router
 
 versioned_prefix = "/v2"
-
 
 # Toggle for surfacing extended API endpoints in the OpenAPI schema
 # and ``/docs``. Endpoints stay mounted regardless — only the public
@@ -86,7 +88,6 @@ management_router.include_router(
     dependencies=[Depends(get_admin_user)],
     include_in_schema=False,
 )
-
 
 # authed routes
 
@@ -170,6 +171,16 @@ model_routers = [
         "tags": ["Model Route Targets"],
     },
     {
+        "router": gpu_instance_persistent_volume_types.router,
+        "prefix": "/gpu-instance-persistent-volume-types",
+        "tags": ["GPU Instance Persistent Volume Types"],
+    },
+    {
+        "router": gpu_instance_persistent_volumes.router,
+        "prefix": "/gpu-instance-persistent-volumes",
+        "tags": ["GPU Instance Persistent Volumes"],
+    },
+    {
         "router": gpu_instance_ssh_public_keys.router,
         "prefix": "/gpu-instance-ssh-public-keys",
         "tags": ["GPU Instance SSH Public Keys"],
@@ -178,6 +189,16 @@ model_routers = [
         "router": gpu_instance_templates.router,
         "prefix": "/gpu-instance-templates",
         "tags": ["GPU Instance Templates"],
+    },
+    {
+        "router": gpu_instance_types.router,
+        "prefix": "/gpu-instance-types",
+        "tags": ["GPU Instance Types"],
+    },
+    {
+        "router": gpu_instances.router,
+        "prefix": "/gpu-instances",
+        "tags": ["GPU Instances"],
     },
 ]
 # worker client have full access to model and model instances
@@ -226,12 +247,6 @@ tenant_routers = model_routers + [
         "router": model_routes.router,
         "prefix": "/model-routes",
         "tags": ["Model Routes"],
-    },
-    {
-        "router": model_route_principals.router,
-        "prefix": "/model-routes",
-        "tags": ["Model Route Principals"],
-        "include_in_schema": _EXTENDED_API_IN_SCHEMA,
     },
     {
         "router": model_evaluations.router,

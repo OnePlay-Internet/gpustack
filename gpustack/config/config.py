@@ -41,15 +41,15 @@ from gpustack.schemas.config import (
     PredefinedConfigNoDefaults,
     GatewayModeEnum,
 )
-from gpustack import __version__
+from gpustack import __version__, __operator_version__
 from gpustack.config.registration import (
     read_registration_token,
     read_worker_token,
     determine_default_registry,
 )
+from gpustack.ssl_context import make_ssl_context
 from gpustack.utils.network import (
     get_first_non_loopback_ip,
-    get_system_trust_store_ssl_context,
     use_proxy_env_for_url,
 )
 from gpustack.utils import platform
@@ -67,7 +67,6 @@ class WorkerConfig(PredefinedConfig):
     token: Optional[str] = None
     server_url: Optional[str] = None
     worker_ip: Optional[str] = None
-    worker_ifname: Optional[str] = None
     worker_name: Optional[str] = None
 
 
@@ -224,6 +223,17 @@ class Config(WorkerConfig, BaseSettings):
     grafana_url: Optional[str] = None
     grafana_worker_dashboard_uid: Optional[str] = "gpustack-worker"
     grafana_model_dashboard_uid: Optional[str] = "gpustack-model"
+
+    # Server-wide default for the GPUStack Operator image. Cluster-level
+    # ``k8s_options.operator_image`` overrides this when set.
+    operator_image: str = f"gpustack/gpustack-operator:{__operator_version__}"
+
+    # Server-wide Kubernetes namespace for gateway routing rules and model
+    # instances (see ``get_namespace``). Cluster manifest rendering uses
+    # ``k8s_options.namespace`` when set and falls back to this value
+    # (then the built-in ``gpustack-system`` default) via
+    # ``TemplateConfig.namespace``.
+    namespace: str = "gpustack-system"
 
     server_id: Optional[str] = None
 
@@ -870,18 +880,20 @@ class Config(WorkerConfig, BaseSettings):
 
     def get_system_reserved(self) -> Dict[str, int]:
         system_reserved_in_bytes = {**(self.system_reserved or {})}
-        system_reserved_in_bytes["ram"] = (
+        ram = (
             system_reserved_in_bytes.get(
                 "ram", system_reserved_in_bytes.pop("memory", 0)
             )
-            << 30
+            or 0
         )
-        system_reserved_in_bytes["vram"] = (
+        vram = (
             system_reserved_in_bytes.get(
                 "vram", system_reserved_in_bytes.pop("gpu_memory", 0)
             )
-            << 30
+            or 0
         )
+        system_reserved_in_bytes["ram"] = int(ram) << 30
+        system_reserved_in_bytes["vram"] = int(vram) << 30
         return system_reserved_in_bytes
 
     def get_proxy_port(self) -> int:
@@ -911,18 +923,20 @@ def get_image_name(
     return f"{prefix}{image_repo}:{version}"
 
 
-def get_cluster_image_name(worker_config: Optional[PredefinedConfigNoDefaults]) -> str:
+def get_cluster_image_name(
+    worker_config: Optional[PredefinedConfigNoDefaults],
+    cluster_registry: Optional[str] = None,
+) -> str:
     cfg = get_global_config()
+    registry = determine_default_registry(
+        cluster_registry or cfg.system_default_container_registry
+    )
     if worker_config is None:
         return get_image_name(
             image_repo=cfg.image_repo,
             image_name_override=cfg.image_name_override,
-            registry=determine_default_registry(cfg.system_default_container_registry),
+            registry=registry,
         )
-    registry = determine_default_registry(
-        worker_config.system_default_container_registry
-        or cfg.system_default_container_registry
-    )
     return get_image_name(
         image_name_override=worker_config.image_name_override
         or cfg.image_name_override,
@@ -931,29 +945,12 @@ def get_cluster_image_name(worker_config: Optional[PredefinedConfigNoDefaults]) 
     )
 
 
-def get_cluster_operator_image_name(
-    worker_config: Optional[PredefinedConfigNoDefaults],
-) -> str:
-    cfg = get_global_config()
-    if worker_config is None:
-        registry = determine_default_registry(cfg.system_default_container_registry)
-        operator_image = cfg.operator_image
-    else:
-        registry = determine_default_registry(
-            worker_config.system_default_container_registry
-            or cfg.system_default_container_registry
-        )
-        operator_image = worker_config.operator_image or cfg.operator_image
-
-    return f"{registry + '/' if registry else ''}{operator_image}"
-
-
 def get_openid_configuration(issuer: str) -> dict:
     """Fetch OpenID configuration from the issuer."""
     url = f"{issuer.rstrip('/')}/.well-known/openid-configuration"
     try:
         use_proxy_env = use_proxy_env_for_url(url)
-        verify = get_system_trust_store_ssl_context()
+        verify = make_ssl_context()
         with httpx.Client(timeout=10, verify=verify, trust_env=use_proxy_env) as client:
             resp = client.get(url)
             resp.raise_for_status()

@@ -36,10 +36,8 @@ from lxml import etree
 from gpustack.utils.convert import safe_b64decode, inflate_data
 from urllib.parse import urlencode
 
-from gpustack.utils.network import (
-    get_system_trust_store_ssl_context,
-    use_proxy_env_for_url,
-)
+from gpustack.ssl_context import make_ssl_context
+from gpustack.utils.network import use_proxy_env_for_url
 
 router = APIRouter()
 timeout = httpx.Timeout(connect=15.0, read=60.0, write=60.0, pool=10.0)
@@ -258,8 +256,12 @@ async def saml_callback(request: Request, session: SessionDep):
                 config, attributes, config.external_auth_avatar_url
             )
 
-        # determine whether the user already exists
-        user = await User.first_by_field(session=session, field="name", value=username)
+        # determine whether the user already exists — scope to USER so a
+        # same-named ORG is not mistaken for an existing user (which would
+        # otherwise skip provisioning and issue a JWT for the Org row).
+        user = await User.first_by_fields(
+            session=session, fields={"name": username, "kind": PrincipalType.USER}
+        )
         # create user
         if not user:
             user_info = User(
@@ -485,7 +487,7 @@ async def oidc_callback(request: Request, session: SessionDep):
     }
     token_endpoint = config.openid_configuration["token_endpoint"]
     use_proxy_env = use_proxy_env_for_url(token_endpoint)
-    verify = get_system_trust_store_ssl_context()
+    verify = make_ssl_context()
     async with httpx.AsyncClient(
         timeout=timeout, verify=verify, trust_env=use_proxy_env
     ) as client:
@@ -537,8 +539,12 @@ async def oidc_callback(request: Request, session: SessionDep):
         except Exception as e:
             logger.error(f"Get OIDC user info error: {str(e)}")
             raise UnauthorizedException(message=str(e))
-    # determine whether the user already exists
-    user = await User.first_by_field(session=session, field="name", value=username)
+    # determine whether the user already exists — scope to USER so a
+    # same-named ORG is not mistaken for an existing user (which would
+    # otherwise skip provisioning and issue a JWT for the Org row).
+    user = await User.first_by_fields(
+        session=session, fields={"name": username, "kind": PrincipalType.USER}
+    )
     # create user
     if not user:
         user_info = User(

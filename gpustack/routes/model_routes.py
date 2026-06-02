@@ -1,9 +1,10 @@
 import logging
 import secrets
+from sqlalchemy import true
 from sqlalchemy.orm import selectinload
-from sqlmodel import col, or_, select
+from sqlmodel import col, func, or_, select
 from sqlmodel.ext.asyncio.session import AsyncSession
-from typing import List, Optional, Set, Tuple, Union, Dict
+from typing import Any, Callable, List, Optional, Set, Tuple, Union, Dict
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
 from gpustack.schemas.model_routes import (
@@ -23,6 +24,8 @@ from gpustack.schemas.model_routes import (
     SetFallbackTargetInput,
     ModelAuthorizationList,
     ModelAuthorizationUpdate,
+    ModelPrincipalAccess,
+    ModelPrincipalRef,
     ModelUserAccessExtended,
     MyModel,
     TargetStateEnum,
@@ -79,6 +82,176 @@ async def get_model_routes(
     )
 
 
+def _model_route_grant_conditions(ctx: TenantContext) -> list:
+    """OR-set making a ``ModelRoute`` list query mirror what a member of
+    the current Org would see — owner-equality PLUS PUBLIC/AUTHED PLUS
+    any grant from ``model_route_principals`` that names the current
+    principal. Used in place of ``tenant_list_conditions`` on the
+    consumption path (admin act-as ``my-models``); the management
+    endpoint (``GET /model-routes``) keeps the narrower owner filter so
+    it stays a "manage what you own" view.
+    """
+    if ctx.current_principal_id is None:
+        return []
+    grant_exists = (
+        select(ModelRoutePrincipalLink.id)
+        .where(
+            ModelRoutePrincipalLink.route_id == ModelRoute.id,
+            ModelRoutePrincipalLink.principal_id == ctx.current_principal_id,
+            ModelRoutePrincipalLink.deleted_at.is_(None),
+        )
+        .exists()
+    )
+    return [
+        or_(
+            col(ModelRoute.access_policy).in_(
+                (AccessPolicyEnum.PUBLIC, AccessPolicyEnum.AUTHED)
+            ),
+            ModelRoute.owner_principal_id == ctx.current_principal_id,
+            grant_exists,
+        )
+    ]
+
+
+async def _model_route_visible_to_ctx(
+    session: AsyncSession,
+    ctx: TenantContext,
+    route: ModelRoute,
+) -> bool:
+    """Single-row mirror of :func:`_model_route_grant_conditions`."""
+    if ctx.current_principal_id is None:
+        return True
+    if route.access_policy in (AccessPolicyEnum.PUBLIC, AccessPolicyEnum.AUTHED):
+        return True
+    if route.owner_principal_id == ctx.current_principal_id:
+        return True
+    stmt = (
+        select(ModelRoutePrincipalLink.id)
+        .where(
+            ModelRoutePrincipalLink.route_id == route.id,
+            ModelRoutePrincipalLink.principal_id == ctx.current_principal_id,
+            ModelRoutePrincipalLink.deleted_at.is_(None),
+        )
+        .limit(1)
+    )
+    return (await session.exec(stmt)).first() is not None
+
+
+def _my_model_visibility_sql(ctx: TenantContext):
+    """SQL predicate partitioning ``MyModel`` rows by the caller's context.
+
+    The view emits one row per (user, route, granting-principal) chain.
+    Personal scope shows only USER/GROUP-mediated grants plus PUBLIC /
+    AUTHED; Org act-as shows only grants tied to that specific Org plus
+    PUBLIC / AUTHED. Returns ``None`` when no filtering applies
+    (platform admin in All mode shouldn't reach the MyModel path; for
+    safety we treat a missing context as no-op).
+    """
+    if ctx.current_principal_id is None:
+        return None
+    if ctx.current_is_personal_scope:
+        return or_(
+            MyModel.via_principal_id.is_(None),
+            MyModel.via_principal_kind.in_(("USER", "GROUP")),
+        )
+    return or_(
+        MyModel.via_principal_id.is_(None),
+        MyModel.via_principal_id == ctx.current_principal_id,
+    )
+
+
+def _my_model_visibility_predicate(
+    ctx: TenantContext,
+) -> Optional[Callable[[Any], bool]]:
+    """Python mirror of :func:`_my_model_visibility_sql` for the
+    streaming path, which can't push WHERE clauses past the event bus.
+    """
+    if ctx.current_principal_id is None:
+        return None
+    if ctx.current_is_personal_scope:
+
+        def _ok(data: Any) -> bool:
+            return getattr(data, "via_principal_id", None) is None or getattr(
+                data, "via_principal_kind", None
+            ) in ("USER", "GROUP")
+
+        return _ok
+    org_id = ctx.current_principal_id
+
+    def _ok(data: Any) -> bool:
+        return (
+            getattr(data, "via_principal_id", None) is None
+            or getattr(data, "via_principal_id", None) == org_id
+        )
+
+    return _ok
+
+
+async def _fetch_granted_route_ids(ctx: TenantContext) -> Set[int]:
+    """Snapshot the set of route IDs granted to ``current_principal_id``
+    via ``model_route_principals``. Used by the streaming path to keep
+    the SSE filter sync; the snapshot can drift if grants change while
+    a stream is open, but ``ModelRoute`` events don't fire on grant
+    edits either, so clients reconnect to refresh.
+    """
+    async with async_session() as session:
+        return set(
+            (
+                await session.exec(
+                    select(ModelRoutePrincipalLink.route_id).where(
+                        ModelRoutePrincipalLink.principal_id
+                        == ctx.current_principal_id,
+                        ModelRoutePrincipalLink.deleted_at.is_(None),
+                    )
+                )
+            ).all()
+        )
+
+
+async def _build_route_grant_stream_filter(
+    ctx: Optional[TenantContext],
+    target_class,
+    include_grants: bool,
+) -> Optional[Callable[[Any], bool]]:
+    """Streaming counterpart to :func:`_model_route_grant_conditions`.
+    Returns ``None`` when no grant filtering applies (non-grants path,
+    non-ModelRoute target, or admin "All" mode without a principal).
+    """
+    if (
+        ctx is None
+        or target_class is not ModelRoute
+        or not include_grants
+        or ctx.current_principal_id is None
+    ):
+        return None
+    granted_route_ids = await _fetch_granted_route_ids(ctx)
+    return _model_route_grant_predicate(ctx, granted_route_ids)
+
+
+def _model_route_grant_predicate(
+    ctx: TenantContext, granted_route_ids: Set[int]
+) -> Callable[[Any], bool]:
+    """Python mirror of :func:`_model_route_grant_conditions` for the
+    streaming path. ``granted_route_ids`` is snapshotted at stream start
+    — ``ModelRoute`` events don't fire on ``model_route_principals``
+    changes, so a mid-stream grant edit isn't observable here either
+    way; clients reconnect to refresh.
+    """
+    current_principal_id = ctx.current_principal_id
+
+    def _ok(data: Any) -> bool:
+        if getattr(data, "access_policy", None) in (
+            AccessPolicyEnum.PUBLIC,
+            AccessPolicyEnum.AUTHED,
+        ):
+            return True
+        if getattr(data, "owner_principal_id", None) == current_principal_id:
+            return True
+        return getattr(data, "id", None) in granted_route_ids
+
+    return _ok
+
+
 async def _get_model_routes(
     params: ModelRouteListParams,
     name: str = None,
@@ -88,6 +261,7 @@ async def _get_model_routes(
     owner_principal_id: Optional[int] = None,
     target_class: Union[ModelRoute, MyModel] = ModelRoute,
     ctx: Optional[TenantContext] = None,
+    include_grants: bool = False,
 ):
     fuzzy_fields = {}
     if search:
@@ -103,21 +277,48 @@ async def _get_model_routes(
         fields["owner_principal_id"] = owner_principal_id
 
     # Apply tenant scoping to the streaming path too. Skipped for the MyModel
-    # view which handles visibility through its own SQL view definition.
+    # view which handles visibility through its own SQL view definition,
+    # and for the grants-inclusive consumption path which needs an OR
+    # against ``model_route_principals`` that a single field-equality
+    # can't express.
     if (
         ctx is not None
         and target_class is ModelRoute
+        and not include_grants
         and ctx.current_principal_id is not None
         and "owner_principal_id" not in fields
     ):
         fields["owner_principal_id"] = ctx.current_principal_id
 
+    my_model_sql_filter = None
+    my_model_stream_filter: Optional[Callable[[Any], bool]] = None
+    if target_class is MyModel and ctx is not None:
+        my_model_sql_filter = _my_model_visibility_sql(ctx)
+        my_model_stream_filter = _my_model_visibility_predicate(ctx)
+
     if params.watch:
+        # Snapshot grant-mediated route ids only on the streaming path —
+        # the paginated branch below pushes the same predicate into SQL
+        # via ``_model_route_grant_conditions`` and doesn't need the
+        # extra round-trip.
+        route_grant_stream_filter = await _build_route_grant_stream_filter(
+            ctx, target_class, include_grants
+        )
+
+        def _stream_filter(data: Any) -> bool:
+            if my_model_stream_filter is not None and not my_model_stream_filter(data):
+                return False
+            if route_grant_stream_filter is not None and not route_grant_stream_filter(
+                data
+            ):
+                return False
+            return categories_filter(data, categories)
+
         return StreamingResponse(
             target_class.streaming(
                 fields=fields,
                 fuzzy_fields=fuzzy_fields,
-                filter_func=lambda data: categories_filter(data, categories),
+                filter_func=_stream_filter,
             ),
             media_type="text/event-stream",
         )
@@ -127,7 +328,15 @@ async def _get_model_routes(
         # Apply tenant scoping when caller passed a TenantContext. Per-user
         # visibility for ModelRoute is via the model_route_principals table.
         if ctx is not None and target_class is ModelRoute:
-            extra_conditions.extend(tenant_list_conditions(ctx, ModelRoute))
+            if include_grants:
+                extra_conditions.extend(_model_route_grant_conditions(ctx))
+            else:
+                extra_conditions.extend(tenant_list_conditions(ctx, ModelRoute))
+        my_model_sql_filter = _append_my_model_conditions(
+            extra_conditions, target_class, my_model_sql_filter
+        )
+        if my_model_sql_filter is not None:
+            extra_conditions.append(my_model_sql_filter)
         if categories:
             conditions = build_category_conditions(session, target_class, categories)
             extra_conditions.append(or_(*conditions))
@@ -141,6 +350,50 @@ async def _get_model_routes(
             order_by=params.order_by,
             extra_conditions=extra_conditions,
         )
+
+
+def _append_my_model_conditions(extra_conditions, target_class, visibility_filter):
+    """Push the MyModel dedup subquery into ``extra_conditions`` and
+    return ``None`` to signal the visibility filter has been absorbed
+    into the subquery (don't double-apply on the outer query). For
+    non-MyModel targets, return ``visibility_filter`` unchanged so the
+    caller's downstream branch handles it as before.
+    """
+    if target_class is not MyModel:
+        return visibility_filter
+    extra_conditions.append(_my_model_dedup_condition(visibility_filter))
+    return None
+
+
+def _my_model_dedup_condition(visibility_filter):
+    """Collapse multi-chain ``(user, route)`` rows down to one in the
+    MyModel list path. The view emits one row per (user, route,
+    granting-principal) chain by contract; without this, ``COUNT(*)``
+    counts chains instead of routes and the page slice can drop chains
+    arbitrarily.
+
+    Ranking happens inside the visibility-filtered chain set —
+    otherwise ``rn=1`` could land on a chain the caller's scope would
+    have dropped, hiding the route entirely. ``MIN(via_principal_id)``
+    is used as a deterministic tiebreak; the surviving ``via_*`` is
+    arbitrary among the visible chains, matching the agreed semantics
+    of "one row per route, via 任取一条". ``_get_model_route`` orders
+    by the same key so detail and list agree on which chain to surface.
+    """
+    ranked = (
+        select(
+            MyModel.pid,
+            func.row_number()
+            .over(
+                partition_by=[MyModel.id, MyModel.user_id],
+                order_by=[col(MyModel.via_principal_id).asc()],
+            )
+            .label("rn"),
+        )
+        .where(visibility_filter if visibility_filter is not None else true())
+        .subquery()
+    )
+    return col(MyModel.pid).in_(select(ranked.c.pid).where(ranked.c.rn == 1))
 
 
 @router.get("/{id}", response_model=ModelRoutePublic, response_model_exclude_none=True)
@@ -159,24 +412,47 @@ async def _get_model_route(
     user_id: Optional[int] = None,
     owner_principal_id: Optional[int] = None,
     ctx: Optional[TenantContext] = None,
+    include_grants: bool = False,
 ):
     fields = {"id": id}
     if user_id is not None:
         fields["user_id"] = user_id
     if owner_principal_id is not None:
         fields["owner_principal_id"] = owner_principal_id
-    existing = await target_class.one_by_fields(
-        session=session,
-        fields=fields,
-    )
+
+    # The MyModel view emits one row per (user, route, granting-principal)
+    # chain; ``one_by_fields`` would .first() back an arbitrary row that
+    # might be filtered out by the caller's context. Push the same
+    # visibility predicate as the list path into the query, and order
+    # by ``via_principal_id`` so the chain we surface here matches the
+    # one ``_get_model_routes`` picked via ``ROW_NUMBER() ... ORDER BY
+    # via_principal_id ASC`` (see :func:`_my_model_dedup_condition`).
+    if target_class is MyModel and ctx is not None:
+        vis = _my_model_visibility_sql(ctx)
+        stmt = select(MyModel)
+        for key, value in fields.items():
+            stmt = stmt.where(getattr(MyModel, key) == value)
+        if vis is not None:
+            stmt = stmt.where(vis)
+        stmt = stmt.order_by(col(MyModel.via_principal_id).asc())
+        existing = (await session.exec(stmt.limit(1))).first()
+    else:
+        existing = await target_class.one_by_fields(
+            session=session,
+            fields=fields,
+        )
     if not existing or existing.deleted_at is not None:
         raise NotFoundException(f"ModelAccess with id '{id}' not found.")
     if ctx is not None and target_class is ModelRoute:
-        assert_resource_visible(
-            ctx,
-            existing,
-            not_found_message=f"ModelAccess with id '{id}' not found.",
-        )
+        if include_grants:
+            if not await _model_route_visible_to_ctx(session, ctx, existing):
+                raise NotFoundException(f"ModelAccess with id '{id}' not found.")
+        else:
+            assert_resource_visible(
+                ctx,
+                existing,
+                not_found_message=f"ModelAccess with id '{id}' not found.",
+            )
     return existing
 
 
@@ -188,7 +464,14 @@ async def create_model_route(
     # owner-name prefix as the effective model name for non-platform
     # Orgs, so two Orgs can each have a route called "qwen3-0.6b"
     # without colliding in the AI proxy match rules.
-    target_org_id = ctx.target_principal_id_for_write()
+    #
+    # Resolve owner from the current Org context, falling back to the
+    # platform Org for admin "All" mode. Routes are an Org-owned
+    # resource — using the admin's USER-principal here (as
+    # ``target_principal_id_for_write`` would) misaligns the route from
+    # its targets, since Models default to the platform Org and trip
+    # the cross-Org check in ``_assert_target_tenant_aligned``.
+    target_org_id = ctx.current_principal_id or platform_principal_id()
     existing = await ModelRoute.one_by_fields(
         session,
         {
@@ -205,28 +488,25 @@ async def create_model_route(
     targets = input.targets or []
     await validate_targets(session, targets, route_owner_principal_id=target_org_id)
     source["targets"] = len(targets)
-    # Stamp the route's owning org from the caller's tenant context.
-    # ModelRouteBase defaults `owner_principal_id` to platform_principal_id()
-    # so `model_dump()` always emits the key — `setdefault` would silently
-    # keep it at 1 for non-platform admins. Override directly.
-    if target_org_id is not None:
-        source["owner_principal_id"] = target_org_id
+    source["owner_principal_id"] = target_org_id
 
     # Multi-tenant default: a non-platform Org's new route is scoped to
-    # that Org (ORG policy — `non_admin_user_models` matches by the
-    # route's `owner_principal_id`). The Default (platform) Org keeps
+    # that Org via ALLOWED_PRINCIPALS with the owning Org auto-granted
+    # below — `non_admin_user_models` matches it through the Org grant
+    # in `model_route_principals`. The Default (platform) Org keeps
     # AUTHED — admin's shared catalog stays visible to every
     # authenticated user, and existing routes migrated to the platform
     # Org must keep working. Caller's explicit `access_policy` always
-    # wins.
+    # wins (and then manages its own principal grants via /principals).
     owner_org_id = source.get("owner_principal_id")
     is_platform_org = owner_org_id == platform_principal_id()
-    if (
+    org_scoped_default = (
         not is_platform_org
         and owner_org_id is not None
         and "access_policy" not in input.model_fields_set
-    ):
-        source["access_policy"] = AccessPolicyEnum.ORG
+    )
+    if org_scoped_default:
+        source["access_policy"] = AccessPolicyEnum.ALLOWED_PRINCIPALS
 
     try:
         route: ModelRoute = await ModelRoute.create(
@@ -239,6 +519,17 @@ async def create_model_route(
             targets=targets,
             auto_commit=False,
         )
+        # Auto-grant the owning Org so the defaulted ALLOWED_PRINCIPALS
+        # route is visible to its members out of the box. Users can add
+        # or remove principals afterward via /principals — the Org grant
+        # is an ordinary row, not special-cased.
+        if org_scoped_default:
+            session.add(
+                ModelRoutePrincipalLink(
+                    route_id=route.id,
+                    principal_id=owner_org_id,
+                )
+            )
         await session.commit()
         await session.refresh(route)
         await revoke_model_access_cache(session=session)
@@ -866,6 +1157,88 @@ async def _replace_route_user_principals(
         )
 
 
+async def _list_route_principals(session, route_id: int) -> List[ModelPrincipalAccess]:
+    """Every principal grant on a route (any kind), with the principal's
+    name / display_name joined for display."""
+    rows = list(
+        (
+            await session.exec(
+                select(ModelRoutePrincipalLink).where(
+                    ModelRoutePrincipalLink.route_id == route_id,
+                    ModelRoutePrincipalLink.deleted_at.is_(None),
+                )
+            )
+        ).all()
+    )
+    if not rows:
+        return []
+    principal_ids = {r.principal_id for r in rows}
+    result = await session.exec(
+        select(Principal).where(Principal.id.in_(principal_ids))
+    )
+    by_id = {p.id: p for p in result.all()}
+    out: List[ModelPrincipalAccess] = []
+    for r in rows:
+        p = by_id.get(r.principal_id)
+        out.append(
+            ModelPrincipalAccess(
+                principal_type=p.kind if p else PrincipalType.USER,
+                principal_id=r.principal_id,
+                principal_name=p.name if p else None,
+                principal_display_name=p.display_name if p else None,
+            )
+        )
+    return out
+
+
+async def _validate_principals(session, principals: List[ModelPrincipalRef]) -> None:
+    """Each ref must name an existing principal whose kind matches. Raises
+    InvalidException otherwise. SYSTEM principals fail the kind check (no
+    caller asks for kind=SYSTEM in an ACL grant)."""
+    for ref in principals:
+        target = await Principal.one_by_id(session, ref.principal_id)
+        if not target or target.deleted_at is not None:
+            raise InvalidException(message=f"Principal {ref.principal_id} not found")
+        if target.kind != ref.principal_type:
+            raise InvalidException(
+                message=(
+                    f"Principal {ref.principal_id} is a {target.kind.value}, "
+                    f"not a {ref.principal_type.value}"
+                )
+            )
+
+
+async def _replace_route_principals(
+    session, route_id: int, principal_ids: List[int]
+) -> None:
+    """Replace the route's entire principal grant set with exactly
+    ``principal_ids`` (any kind). Callers validate the refs first."""
+    desired: Set[int] = set(principal_ids)
+
+    existing = list(
+        (
+            await session.exec(
+                select(ModelRoutePrincipalLink).where(
+                    ModelRoutePrincipalLink.route_id == route_id,
+                    ModelRoutePrincipalLink.deleted_at.is_(None),
+                )
+            )
+        ).all()
+    )
+    existing_by_principal = {row.principal_id: row for row in existing}
+
+    for principal_id, row in existing_by_principal.items():
+        if principal_id not in desired:
+            await session.delete(row)
+
+    for principal_id in desired:
+        if principal_id in existing_by_principal:
+            continue
+        session.add(
+            ModelRoutePrincipalLink(route_id=route_id, principal_id=principal_id)
+        )
+
+
 @router.get("/{id}/access", response_model=ModelAuthorizationList)
 async def get_model_authorization_list(session: SessionDep, id: int):
     model: ModelRoute = await ModelRoute.one_by_id(session, id)
@@ -874,6 +1247,7 @@ async def get_model_authorization_list(session: SessionDep, id: int):
 
     return ModelAuthorizationList(
         items=await _list_route_users(session, id),
+        principals=await _list_route_principals(session, id),
         access_policy=model.access_policy,
     )
 
@@ -886,8 +1260,20 @@ async def add_model_authorization(
     if not model:
         raise NotFoundException(message="Model not found")
 
-    requested_user_ids = [u.id for u in access_request.users]
-    if requested_user_ids:
+    # Two mutually exclusive grant surfaces (else = "don't touch grants",
+    # e.g. a plain policy switch):
+    #   * ``principals`` (preferred) replaces the FULL grant set, any
+    #     kind. An empty list clears all grants.
+    #   * ``users`` (deprecated) replaces only USER-kind grants.
+    replace_principals = access_request.principals is not None
+    replace_users = not replace_principals and access_request.users is not None
+
+    # Validate up front so bad refs surface as 4xx, not the 500 wrapper
+    # around the mutation block below.
+    requested_user_ids = [u.id for u in (access_request.users or [])]
+    if replace_principals:
+        await _validate_principals(session, access_request.principals)
+    elif replace_users and requested_user_ids:
         users = await User.all_by_fields(
             session=session,
             fields={},
@@ -898,36 +1284,33 @@ async def add_model_authorization(
             if req_id not in existing_user_ids:
                 raise NotFoundException(message=f"User ID {req_id} not found")
 
-    # Cache invalidation needs the union of "previously granted" and
-    # "newly granted" user ids — anyone in either set may see a
-    # different model list after the change.
-    previous_users = await _list_route_users(session, id)
-    affected_user_ids: Optional[Set[int]] = {item.id for item in previous_users} | set(
-        requested_user_ids
-    )
-    cache_model = model
+    # Cache invalidation. The USER-list path can scope to the affected
+    # users (previously + newly granted). Replacing arbitrary principals
+    # (org / group) widens visibility unpredictably, so invalidate
+    # broadly — as does any access_policy change.
+    affected_user_ids: Optional[Set[int]] = None
+    cache_model: Optional[ModelRoute] = None
+    if replace_users:
+        previous_users = await _list_route_users(session, id)
+        affected_user_ids = {item.id for item in previous_users} | set(
+            requested_user_ids
+        )
+        cache_model = model
 
     if (
         access_request.access_policy is not None
         and access_request.access_policy != model.access_policy
     ):
         model.access_policy = access_request.access_policy
-        # Switching policy (e.g. to PUBLIC) widens visibility beyond
-        # the explicit user list — broaden cache invalidation.
         affected_user_ids = None
         cache_model = None
 
-    # `users` is the source-of-truth for grants only under the
-    # ALLOWED_USERS policy. ALLOWED_PRINCIPALS manages grants via
-    # `/principals` (which can also create USER-kind rows), and the
-    # other policies don't care about the explicit list. Wiping
-    # USER-kind rows when the policy isn't ALLOWED_USERS would
-    # silently delete USER grants that ALLOWED_PRINCIPALS just
-    # attached.
-    should_replace_users = model.access_policy == AccessPolicyEnum.ALLOWED_USERS
-
     try:
-        if should_replace_users:
+        if replace_principals:
+            await _replace_route_principals(
+                session, id, [p.principal_id for p in access_request.principals]
+            )
+        elif replace_users:
             await _replace_route_user_principals(session, id, requested_user_ids)
         await revoke_model_access_cache(
             session=session,
@@ -941,6 +1324,7 @@ async def add_model_authorization(
 
     return ModelAuthorizationList(
         items=await _list_route_users(session, id),
+        principals=await _list_route_principals(session, id),
         access_policy=model.access_policy,
     )
 
@@ -954,21 +1338,26 @@ async def get_my_models(
 ):
     """List the model routes available to the calling user.
 
-    For non-admin users: visibility is governed by `non_admin_user_models`,
-    which already encodes PUBLIC/AUTHED/ORG/ALLOWED_PRINCIPALS semantics. We do NOT additionally filter by current_principal_id — routes
-    published cross-org via ALLOWED_PRINCIPALS would otherwise be hidden.
-    For platform admins: optionally filter by org if a context was provided.
+    Non-admin: read the ``non_admin_user_models`` view (one row per
+    user × route × granting-principal) and partition it by the
+    request's ``current_principal_id`` — Personal scope sees only
+    USER/GROUP-mediated grants plus PUBLIC/AUTHED; Org act-as sees
+    only grants tied to that Org plus PUBLIC/AUTHED.
+
+    Platform admin: list the live ``model_routes`` table. With an Org
+    context set, the act-as filter matches what a member of that Org
+    would see; without one, return everything (the "All" view).
     """
     user = ctx.user
     user_id = None
     target_class = ModelRoute
-    owner_principal_id = None
     if not user.is_admin:
         target_class = MyModel
         user_id = user.id
-    else:
-        # Admin can opt into a per-org view by setting the org context.
-        owner_principal_id = ctx.current_principal_id
+    # Admin act-as: match what an org member would see (own + PUBLIC /
+    # AUTHED + cross-tenant grants), not just routes whose ``owner`` is
+    # this org. Admin "All" mode (no current_principal_id) keeps
+    # bypassing tenant filters via ``include_grants`` returning [].
 
     return await _get_model_routes(
         params=params,
@@ -976,7 +1365,8 @@ async def get_my_models(
         categories=categories,
         target_class=target_class,
         user_id=user_id,
-        owner_principal_id=owner_principal_id,
+        ctx=ctx,
+        include_grants=user.is_admin,
     )
 
 
@@ -989,17 +1379,15 @@ async def get_my_model(
     user = ctx.user
     user_id = None
     target_class = ModelRoute
-    owner_principal_id = None
     if not user.is_admin:
         target_class = MyModel
         user_id = user.id
-    else:
-        owner_principal_id = ctx.current_principal_id
 
     return await _get_model_route(
         session=session,
         id=id,
         user_id=user_id,
-        owner_principal_id=owner_principal_id,
         target_class=target_class,
+        ctx=ctx,
+        include_grants=user.is_admin,
     )

@@ -92,8 +92,6 @@ extra:
       link: https://pypi.org/project/gpustack/
     - icon: fontawesome/brands/discord
       link: https://discord.gg/VXYJzuaqwD
-    - icon: fontawesome/brands/weixin
-      link: https://github.com/gpustack/gpustack/blob/main/docs/assets/wechat-group-qrcode.jpg
 extra_javascript:
   - image-selector/assets/extra.js
   - https://unpkg.com/katex@0/dist/katex.min.js
@@ -191,6 +189,7 @@ nav:
           - Adding a GPU Cluster Using DigitalOcean: tutorials/adding-gpucluster-using-digitalocean.md
           - Adding a GPU Cluster Using Kubernetes: tutorials/adding-gpucluster-using-kubernetes.md
           - Managing Model Routes: tutorials/managing-model-routes.md
+          - Serving Models with LoRA Adapters: tutorials/serving-with-lora-adapters.md
       - Integrations:
           - Inference APIs: integrations/inference-apis.md
           - Integrate with Claude Code: integrations/integrate-with-claude-code.md

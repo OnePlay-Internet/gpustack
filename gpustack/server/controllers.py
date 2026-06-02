@@ -16,10 +16,27 @@ from gpustack.config.config import (
     Config,
     get_cluster_image_name,
 )
-from gpustack.gpu_instances import (
-    sync_ssh_public_key_to_clusters,
-    get_ssh_public_key,
-    sync_ssh_public_key_to_cluster,
+from gpustack.gpu_instances.cluster_apis import ClusterOps
+from gpustack.gpu_instances.cluster_apis_util import (
+    spec_instance,
+    spec_persistent_volume,
+    spec_persistent_volume_type,
+    get_persistent_volume_type_name,
+    parse_persistent_volume_type_name,
+    principal_namespace_identifier,
+)
+from gpustack.schemas.gpu_instances import (
+    GPUInstance,
+    GPUInstanceStatus,
+)
+from gpustack.schemas.gpu_instance_persistent_volumes import (
+    GPUInstancePersistentVolume,
+)
+from gpustack.schemas.gpu_instance_persistent_volume_types import (
+    GPUInstancePersistentVolumeType,
+)
+from gpustack.schemas.gpu_instance_ssh_public_keys import (
+    GPUInstanceSSHPublicKey,
 )
 from gpustack.policies.scorers.offload_layer_scorer import OffloadLayerScorer
 from gpustack.policies.scorers.placement_scorer import PlacementScorer, ScaleTypeEnum
@@ -28,7 +45,6 @@ from gpustack.policies.scorers.score_chain import (
 )
 from gpustack.policies.base import ModelInstanceScore
 from gpustack.policies.scorers.status_scorer import StatusScorer
-from gpustack.schemas import GPUInstanceSSHPublicKey
 from gpustack.schemas.inference_backend import (
     InferenceBackend,
     get_built_in_backend,
@@ -187,6 +203,10 @@ class ModelController:
             )
             worker_by_id = {worker.id: worker for worker in workers}
 
+        lora_route_names = [
+            lora_route_name_for(model.name, entry.lora_name)
+            for entry in normalized_lora_list(model)
+        ]
         await mcp_handler.ensure_model_mcp_bridge(
             event_type=event_type,
             model_id=model.id,
@@ -195,6 +215,7 @@ class ModelController:
             namespace=self._config.gateway_namespace,
             cluster_id=model.cluster_id,
             workers=worker_by_id,
+            lora_route_names=lora_route_names,
         )
 
     async def _reconcile(self, event: Event):
@@ -433,7 +454,11 @@ async def distribute_models_to_user(
     ]:
         for user_id in ids:
             my_model = MyModel(
-                pid=f"{model_id}:{user_id}",
+                # Match the view's pid layout (``route_id:user_id:via``).
+                # The publisher doesn't know the granting chain, so the
+                # via suffix is empty — same shape as the PUBLIC/AUTHED
+                # branch of ``non_admin_user_models``.
+                pid=f"{model_id}:{user_id}:",
                 user_id=user_id,
                 **model_dict,
             )
@@ -1203,6 +1228,14 @@ async def calculate_model_destinations(
     LoRA module name reach vLLM intact.
     """
     downstream_model_name = overridden_model_name or model.name
+    # LoRA targets share the base model's instances; route them to a per-LoRA
+    # aliased service (same address, distinct name) registered in ensure_model_mcp_bridge
+    # so the gateway can weight and rewrite per LoRA instead of collapsing onto one.
+    registry_name_suffix = (
+        mcp_handler.lora_registry_name_suffix(overridden_model_name)
+        if overridden_model_name is not None and ":" in overridden_model_name
+        else None
+    )
     cluster_registry = await get_cluster_registry(session, model.cluster_id)
     if cluster_registry is not None:
         return [(1, downstream_model_name, cluster_registry)]
@@ -1234,7 +1267,10 @@ async def calculate_model_destinations(
     )
     workers = {worker.id: worker for worker in worker_list}
     return mcp_handler.model_instances_registry_list(
-        instances, workers, downstream_model_name=downstream_model_name
+        instances,
+        workers,
+        downstream_model_name=downstream_model_name,
+        registry_name_suffix=registry_name_suffix,
     )
 
 
@@ -2285,7 +2321,10 @@ class WorkerProvisioningController:
         user_data = await client.construct_user_data(
             server_url=worker.cluster.server_url or cfg.server_external_url,
             token=worker.cluster.registration_token,
-            image_name=get_cluster_image_name(worker.cluster.worker_config),
+            image_name=get_cluster_image_name(
+                worker.cluster.worker_config,
+                worker.cluster.system_default_container_registry,
+            ),
             os_image=worker.worker_pool.os_image,
             secret_configs=secret_configs,
             worker_name=worker.name,
@@ -2548,7 +2587,6 @@ class ClusterController:
         Reconcile the cluster state.
         """
         await self._sync_cluster_state(event)
-        await self._ensure_gpu_instance_ssh_public_key(event)
         if self._disable_gateway:
             return
         await self._ensure_worker_mcp_bridge(event)
@@ -2598,44 +2636,6 @@ class ClusterController:
         except Exception as e:
             logger.error(f"Failed to ensure MCPBridge for cluster {cluster.name}: {e}")
             raise
-
-    async def _ensure_gpu_instance_ssh_public_key(self, event: Event):
-        """
-        Ensure the corresponding GPUStack Operator InstanceSSHPublicKey resource is synced.
-        """
-        cluster: Cluster = event.data
-        if cluster.provider != ClusterProvider.Kubernetes:
-            return
-        owner_principal_id = cluster.owner_principal_id
-
-        async with async_session() as session:
-            cluster = await Cluster.one_by_id(
-                session,
-                cluster.id,
-                options=[selectinload(Cluster.cluster_workers)],
-            )
-            if cluster is None or cluster.ready_workers == 0:
-                return
-
-            ssh_public_key = await get_ssh_public_key(
-                session=session,
-                owner_principal_id=owner_principal_id,
-            )
-            principal = await Principal.one_by_id(session, owner_principal_id)
-
-        if principal is None:
-            logger.error(
-                f"Owner principal (id: {owner_principal_id}) of cluster "
-                f"{cluster.name}(id: {cluster.id}) not found"
-            )
-            return
-
-        await sync_ssh_public_key_to_cluster(
-            ssh_public_key=ssh_public_key,
-            server_api_port=self._cfg.api_port,
-            cluster_id=cluster.id,
-            cluster_owner_principal_name=principal.name,
-        )
 
 
 async def notify_model_route_target(session: AsyncSession, model: Model, event: Event):
@@ -3102,60 +3102,584 @@ class ModelRouteController:
             await distribute_models_to_user(session, model_route, event)
 
 
-class GPUInstanceSSHPublicKeyController:
+class GPUInstanceController:
+    """Reconciles ``GPUInstance`` rows against the worker cluster CRDs.
+
+    The Python row is the source of truth; this controller projects each
+    ``GPUInstance`` change onto ``worker.gpustack.ai/v1`` CRs via
+    :class:`ClusterOps` and writes back the observed phase. SSH keys,
+    persistent-volume types, and persistent volumes are sub-resources
+    that aren't globally synced — their lifecycle is bound to the owning
+    instance and handled inline here.
+    """
+
+    PHASE_INSTANCE_CREATE_FAILED = "CreateFailed"
+    PHASE_SSH_KEY_CREATE_FAILED = "SSHPublicKeyCreateFailed"
+    PHASE_PV_TYPE_CREATE_FAILED = "PersistentVolumeTypeCreateFailed"
+    PHASE_PV_CREATE_FAILED = "PersistentVolumeCreateFailed"
+    PHASE_READY = "Ready"
+
     def __init__(self, cfg: Config):
-        self._cfg = cfg
-        self._k8s_config = get_async_k8s_config(cfg=cfg)
+        self._config = cfg
+        # Per-iid pending event slot — at most one event per iid sits in
+        # the queue at any time. A pending DELETED is sticky: later events
+        # for the same iid are dropped so they can't race the teardown.
+        self._pending: Dict[Any, Event] = {}
+        # Per-iid worker tasks. One task per iid serializes processing for
+        # that iid without an explicit lock.
+        self._workers: Dict[Any, asyncio.Task] = {}
 
     async def start(self):
-        async for event in GPUInstanceSSHPublicKey.subscribe(
-            source="gpu_instance_ssh_public_key_controller"
-        ):
-            try:
-                await self._reconcile(event)
-            except Exception:
-                logger.exception("Failed to reconcile gpu instance ssh public key")
+        try:
+            async for event in GPUInstance.subscribe(source="gpu_instance_controller"):
+                if event.type == EventType.HEARTBEAT:
+                    continue
+                if event.data is None:
+                    continue
+
+                if event.type == EventType.CREATED:
+                    instance: GPUInstance = event.data
+                    phase = (instance.status or GPUInstanceStatus()).phase
+                    if phase is not None:
+                        # Terminal *CreateFailed / fully Ready: nothing to reconcile.
+                        if phase.endswith("CreateFailed") or self._is_all_ready(
+                            instance
+                        ):
+                            continue
+                        # Otherwise let UPDATED logic re-sync against the cluster.
+                        self._enqueue(Event(type=EventType.UPDATED, data=instance))
+                        continue
+
+                    # Brand-new instance (phase=None) — run the create flow inline.
+                    # Most startup CREATED events are filtered above, so this
+                    # rarely blocks the subscribe loop in practice.
+                    try:
+                        await self._reconcile_created(instance)
+                    except Exception:
+                        logger.exception(
+                            f"Failed to reconcile GPU instance {instance.id}"
+                        )
+                    continue
+
+                # UPDATED / DELETED — coalesce per iid and run on a worker task.
+                self._enqueue(event)
+        finally:
+            for task in list(self._workers.values()):
+                task.cancel()
+            if self._workers:
+                await asyncio.gather(*self._workers.values(), return_exceptions=True)
+
+    def _enqueue(self, event: Event):
+        """Coalesce ``event`` into the per-iid pending slot and ensure a worker."""
+        iid = event.data.id if event.data is not None else event.id
+        if iid is None:
+            return
+        existing = self._pending.get(iid)
+        # DELETED has the highest priority — never let it be overwritten by a
+        # later UPDATED for the same iid.
+        if existing is not None and existing.type == EventType.DELETED:
+            return
+        self._pending[iid] = event
+        if iid not in self._workers:
+            self._workers[iid] = asyncio.create_task(self._worker(iid))
+
+    async def _worker(self, iid: Any):
+        try:
+            while True:
+                event = self._pending.pop(iid, None)
+                if event is None:
+                    return
+                try:
+                    await self._reconcile(event)
+                except Exception:
+                    logger.exception(f"Failed to reconcile GPU instance {iid}")
+        finally:
+            # Synchronous with the coroutine exit: ``_enqueue`` cannot
+            # interleave between ``pop(None)`` and this cleanup, so a
+            # late-arriving event always spawns a fresh worker. The popped
+            # Task is ``self`` — bind to ``_`` to flag the intentional discard
+            # (otherwise type-checkers warn about an unawaited Task).
+            _ = self._workers.pop(iid, None)
 
     async def _reconcile(self, event: Event):
-        """
-        Reconcile the gpu instance ssh public key.
-        """
-        if event.type == EventType.DELETED:
+        instance: GPUInstance = event.data
+        if instance is None:
             return
+        if event.type == EventType.UPDATED:
+            await self._reconcile_updated(instance, event.changed_fields or {})
+        elif event.type == EventType.DELETED:
+            await self._reconcile_deleted(instance)
 
-        ret: GPUInstanceSSHPublicKey = event.data
-        if ret is None or ret.spec is None or ret.spec.data is None:
-            return
-        owner_principal_id = ret.owner_principal_id
-
+    async def _reconcile_created(self, instance: GPUInstance):  # noqa: C901
         async with async_session() as session:
-            clusters = await Cluster.all_by_fields(
-                session=session,
-                fields={
-                    "provider": ClusterProvider.Kubernetes,
-                    "state": ClusterStateEnum.READY,
-                    "owner_principal_id": owner_principal_id,
-                    "deleted_at": None,
-                },
-                options=[selectinload(Cluster.cluster_workers)],
+            fresh = await GPUInstance.one_by_id(session, instance.id)
+            if fresh is None or fresh.deleted_at is not None:
+                return
+
+            # Defensive: ``start()`` already filters CREATED events whose
+            # phase is set, but the reload above can still pick up a phase
+            # that landed between event emission and now. Re-route to
+            # UPDATED instead of writing a transient status to bounce off
+            # the bus.
+            if (phase := (fresh.status or GPUInstanceStatus()).phase) is not None:
+                if phase.endswith("CreateFailed") or self._is_all_ready(fresh):
+                    return
+                self._enqueue(Event(type=EventType.UPDATED, data=fresh))
+                return
+
+            built = await self._build_ops(session, fresh)
+            if built is None:
+                return
+            ops, principal_identifier = built
+
+            async with ops:
+                # Create/Update referenced SSH public keys if needed.
+                if fresh.spec.ssh_public_keys is not None:
+                    try:
+                        data = await self._aggregate_ssh_public_key_data(session, fresh)
+                        await ops.upsert_ssh_public_key(
+                            name=fresh.name,
+                            spec={"data": data},
+                        )
+                    except Exception as e:
+                        logger.exception(
+                            f"Failed to sync worker-side ssh public key for {fresh.name}"
+                        )
+                        if fresh.status.phase != self.PHASE_READY:
+                            await self._set_status(
+                                session,
+                                fresh,
+                                GPUInstanceStatus(
+                                    phase=self.PHASE_SSH_KEY_CREATE_FAILED,
+                                    phase_message=f"Failed to sync worker-side ssh public key: {e}",
+                                    namespace=ops.org_namespace,
+                                ),
+                            )
+                        return
+
+                # Create referenced persistent volume type and persistent volume if needed.
+                pv_name: Optional[str] = None
+                volume = fresh.spec.volume
+                if volume is not None:
+                    if volume.persistent is not None:
+                        pv_name = volume.persistent.name
+                    elif volume.persistent_template is not None:
+                        pv_name = volume.persistent_template.name
+                if pv_name is not None:
+                    pv = await GPUInstancePersistentVolume.first_by_fields(
+                        session,
+                        fields={
+                            "owner_principal_id": fresh.owner_principal_id,
+                            "name": pv_name,
+                        },
+                    )
+                    if pv is None:
+                        logger.error(
+                            f"Failed to find server-side pv for {fresh.name} with pv name {pv_name}"
+                        )
+                        await self._set_status(
+                            session,
+                            fresh,
+                            GPUInstanceStatus(
+                                phase=self.PHASE_PV_CREATE_FAILED,
+                                phase_message=f"Not found server-side persistent volume: {pv_name}",
+                                namespace=ops.org_namespace,
+                            ),
+                        )
+                        return
+
+                    pvt_name = pv.spec.type_
+                    pvt = await GPUInstancePersistentVolumeType.first_by_fields(
+                        session,
+                        fields={
+                            "owner_principal_id": fresh.owner_principal_id,
+                            "name": pvt_name,
+                        },
+                    )
+                    if pvt is None:
+                        logger.error(
+                            f"Failed to find server-side pv type for {fresh.name} with pvt name {pvt_name}"
+                        )
+                        await self._set_status(
+                            session,
+                            fresh,
+                            GPUInstanceStatus(
+                                phase=self.PHASE_PV_TYPE_CREATE_FAILED,
+                                phase_message=f"Not found server-side persistent volume type: {pvt_name}",
+                                namespace=ops.org_namespace,
+                            ),
+                        )
+                        return
+
+                    pvt_cluster_name = get_persistent_volume_type_name(
+                        pvt_name,
+                        principal_identifier=principal_identifier,
+                    )
+                    try:
+                        await ops.create_persistent_volume_type(
+                            name=pvt_cluster_name,
+                            spec=spec_persistent_volume_type(
+                                pvt, ops.cluster_owner_principal_identifier
+                            ),
+                        )
+                    except Exception as e:
+                        logger.exception(
+                            f"Failed to create worker-side pv type for {fresh.name}"
+                        )
+                        await self._set_status(
+                            session,
+                            fresh,
+                            GPUInstanceStatus(
+                                phase=self.PHASE_PV_TYPE_CREATE_FAILED,
+                                phase_message=f"Failed to create worker-side persistent volume type: {e}",
+                                namespace=ops.org_namespace,
+                            ),
+                        )
+                        return
+
+                    try:
+                        pv_spec = spec_persistent_volume(pv)
+                        # The worker-side PV references the worker-side PVT
+                        # name (prefixed with the principal name); overwrite the
+                        # raw type id from the row.
+                        pv_spec["type"] = pvt_cluster_name
+                        await ops.create_persistent_volume(
+                            name=pv.name,
+                            spec=pv_spec,
+                        )
+                    except Exception as e:
+                        logger.exception(
+                            f"Failed to create worker-side pv for {fresh.name}"
+                        )
+                        await self._set_status(
+                            session,
+                            fresh,
+                            GPUInstanceStatus(
+                                phase=self.PHASE_PV_CREATE_FAILED,
+                                phase_message=f"Failed to create worker-side persistent volume: {e}",
+                                namespace=ops.org_namespace,
+                            ),
+                        )
+                        return
+
+                # Create Instance.
+                try:
+                    await ops.create_instance(
+                        name=fresh.name,
+                        spec=spec_instance(fresh),
+                    )
+                except Exception as e:
+                    logger.exception(
+                        f"Failed to create worker-side instance for {fresh.name}"
+                    )
+                    await self._set_status(
+                        session,
+                        fresh,
+                        GPUInstanceStatus(
+                            phase=self.PHASE_INSTANCE_CREATE_FAILED,
+                            phase_message=f"Failed to create worker-side instance: {e}",
+                            namespace=ops.org_namespace,
+                        ),
+                    )
+                    return
+
+                # Skip writing a transient "Created" phase to the DB —
+                # synthesize an UPDATED event so the per-iid worker reads
+                # back the real cluster status without a bus round-trip.
+                self._enqueue(Event(type=EventType.UPDATED, data=fresh))
+
+    async def _reconcile_updated(
+        self, instance: GPUInstance, changed_fields: Dict[str, Tuple[Any, Any]]
+    ):  # noqa: C901
+        async with async_session() as session:
+            fresh = await GPUInstance.one_by_id(session, instance.id)
+            if fresh is None or fresh.deleted_at is not None:
+                return
+
+            built = await self._build_ops(session, fresh)
+            if built is None:
+                return
+            ops, _ = built
+            async with ops:
+                # Update referenced SSH public keys if needed.
+                if "spec" in changed_fields:
+                    try:
+                        data = await self._aggregate_ssh_public_key_data(session, fresh)
+                        await ops.upsert_ssh_public_key(
+                            name=fresh.name,
+                            spec={"data": data},
+                        )
+                    except Exception:
+                        logger.exception(
+                            f"Failed to sync worker-side ssh public key for {fresh.name}"
+                        )
+
+                if (phase := (fresh.status or GPUInstanceStatus()).phase) is not None:
+                    if phase.endswith("CreateFailed"):
+                        logger.warning(
+                            f"GPUInstance {fresh.name} is in {phase} phase, skip updating"
+                        )
+                        return
+                    if self._is_all_ready(fresh):
+                        logger.debug(
+                            f"GPUInstance {fresh.name} is already in Ready phase, skip updating"
+                        )
+                        return
+                    logger.debug(
+                        f"GPUInstance {fresh.name} is not all ready, try updating and reconciling"
+                    )
+
+                # Read the instance to get the latest status.
+                try:
+                    read = await ops.read_instance(fresh.name)
+                    if read is None:
+                        read = {
+                            "status": {
+                                "phase": "Unknown",
+                                "phaseMessage": "Not found in cluster",
+                            }
+                        }
+                except Exception:
+                    logger.exception(
+                        f"Failed to read worker-side instance for {fresh.name}"
+                    )
+                    read = {
+                        "status": {
+                            "phase": "Unknown",
+                            "phaseMessage": "Failed to read from cluster",
+                        }
+                    }
+
+                await self._set_status(
+                    session,
+                    fresh,
+                    GPUInstanceStatus(
+                        **read.get("status"),
+                        namespace=ops.org_namespace,
+                    ),
+                )
+
+    async def _reconcile_deleted(self, instance: GPUInstance):  # noqa: C901
+        async with async_session() as session:
+            built = await self._build_ops(session, instance)
+            if built is None:
+                return
+            ops, principal_identifier = built
+
+            async with ops:
+                # Delete Instance.
+                try:
+                    await ops.delete_instance(instance.name)
+                except Exception:
+                    logger.exception(
+                        f"Failed to delete worker-side instance for {instance.name}"
+                    )
+
+                # Delete referenced SSH public key.
+                try:
+                    await ops.delete_ssh_public_key(instance.name)
+                except Exception:
+                    logger.exception(
+                        f"Failed to delete worker-side ssh public key for {instance.name}"
+                    )
+
+                # Delete Persistent volume cleanup.
+                # GPUInstancePersistentVolume and GPUInstancePersistentVolumeType have no global syncer,
+                # so we evaluate against the DB state and clean up the worker side ourselves.
+                volume = instance.spec.volume
+                if volume is None:
+                    return
+
+                if volume.persistent_template is not None:
+                    template = volume.persistent_template
+
+                    pv_name = template.name
+                    pvt_name = template.spec.type_
+                    should_delete_pv = template.release_with_instance
+
+                    pv = await GPUInstancePersistentVolume.first_by_fields(
+                        session,
+                        fields={
+                            "owner_principal_id": instance.owner_principal_id,
+                            "name": pv_name,
+                        },
+                    )
+                    if should_delete_pv:
+                        if pv is not None:
+                            try:
+                                await pv.delete(session)
+                            except Exception:
+                                logger.exception(
+                                    f"Failed to delete PV row for {pv_name}"
+                                )
+                    else:
+                        # Even the release_with_instance is false,
+                        # if the PV row is already gone,
+                        # we can still delete the worker-side PV to avoid orphan resource.
+                        should_delete_pv = pv is None
+
+                    if should_delete_pv:
+                        try:
+                            await ops.delete_persistent_volume(pv_name)
+                        except Exception:
+                            logger.exception(
+                                f"Failed to delete worker-side pv {pv_name}"
+                            )
+
+                        pvt = await GPUInstancePersistentVolumeType.first_by_fields(
+                            session,
+                            fields={
+                                "owner_principal_id": instance.owner_principal_id,
+                                "name": pvt_name,
+                            },
+                        )
+                        if pvt is not None:
+                            return
+
+                        # The PVT row is gone,
+                        # so we can delete the worker-side PVT unconditionally if it exists.
+                        pvt_cluster_name = get_persistent_volume_type_name(
+                            template.spec.type_,
+                            principal_identifier=principal_identifier,
+                        )
+                        try:
+                            await ops.delete_persistent_volume_type(pvt_cluster_name)
+                        except Exception:
+                            logger.exception(
+                                f"Failed to delete worker-side pv type {pvt_cluster_name}"
+                            )
+
+                elif volume.persistent is not None:
+                    pv_name = volume.persistent.name
+
+                    pv = await GPUInstancePersistentVolume.first_by_fields(
+                        session,
+                        fields={
+                            "owner_principal_id": instance.owner_principal_id,
+                            "name": pv_name,
+                        },
+                    )
+                    if pv is not None:
+                        return
+
+                    cluster_pv = await ops.read_persistent_volume(pv_name)
+                    if cluster_pv is None:
+                        return
+
+                    # The PV row is gone,
+                    # so we can delete the worker-side PV unconditionally if it exists.
+                    try:
+                        await ops.delete_persistent_volume(pv_name)
+                    except Exception:
+                        logger.exception(f"Failed to delete worker-side pv {pv_name}")
+
+                    pvt_cluster_name = (cluster_pv.get("spec") or {}).get("type")
+                    parsed = parse_persistent_volume_type_name(pvt_cluster_name)
+                    if parsed is not None:
+                        pvt_name, _ = parsed
+
+                        pvt = await GPUInstancePersistentVolumeType.first_by_fields(
+                            session,
+                            fields={
+                                "owner_principal_id": instance.owner_principal_id,
+                                "name": pvt_name,
+                            },
+                        )
+                        if pvt is not None:
+                            return
+
+                        # The PVT row is gone,
+                        # so we can delete the worker-side PVT unconditionally if it exists.
+                        try:
+                            await ops.delete_persistent_volume_type(pvt_cluster_name)
+                        except Exception:
+                            logger.exception(
+                                f"Failed to delete worker-side pv type {pvt_cluster_name}"
+                            )
+
+    async def _build_ops(
+        self,
+        session: AsyncSession,
+        instance: GPUInstance,
+    ) -> Optional[Tuple[ClusterOps, str]]:
+        """Resolve the cluster + principal and construct a ``ClusterOps``.
+
+        Returns ``(ops, principal_identifier)`` or ``None`` when either
+        the cluster or the owning principal has gone away.
+        """
+
+        cluster = await Cluster.one_by_id(session, instance.cluster_id)
+        if cluster is None:
+            logger.warning(
+                "GPU instance %s references missing cluster %s",
+                instance.name,
+                instance.cluster_id,
             )
-            principal = await Principal.one_by_id(session, owner_principal_id)
+            return None
 
-            ssh_public_key = ret.spec.data
-            cluster_ids = [
-                cluster.id for cluster in clusters if cluster.ready_workers > 0
-            ]
-
+        principal = await Principal.one_by_id(session, instance.owner_principal_id)
         if principal is None:
-            logger.error(
-                f"Owner principal (id: {owner_principal_id}) of gpu instance ssh "
-                f"public key not found"
+            logger.warning(
+                "GPU instance %s references missing principal %s",
+                instance.name,
+                instance.owner_principal_id,
             )
-            return
+            return None
 
-        await sync_ssh_public_key_to_clusters(
-            ssh_public_key=ssh_public_key,
-            server_api_port=self._cfg.api_port,
-            cluster_ids=cluster_ids,
-            cluster_owner_principal_name=principal.name,
+        owner_identifier = principal_namespace_identifier(principal)
+        ops = ClusterOps(
+            server_api_port=self._config.get_api_port(),
+            cluster_id=cluster.id,
+            cluster_registration_token=cluster.registration_token,
+            cluster_owner_principal_identifier=owner_identifier,
         )
+        return ops, owner_identifier
+
+    def _is_all_ready(
+        self,
+        instance: GPUInstance,
+    ) -> bool:
+        if (instance.status or GPUInstanceStatus()).phase != self.PHASE_READY:
+            return False
+
+        fields = []
+        if instance.spec.ports:
+            fields.extend(["access_addresses", "ports"])
+        if instance.spec.resources and instance.spec.resources.accelerator:
+            fields.append("allocations")
+        return all(getattr(instance.status, field) for field in fields)
+
+    @staticmethod
+    async def _set_status(
+        session: AsyncSession,
+        instance: GPUInstance,
+        expected: GPUInstanceStatus,
+    ):
+        """Update the status of the instance with the expected status."""
+        current = instance.status or GPUInstanceStatus()
+        if current.phase == expected.phase:
+            expected.count = current.count + 1
+            await asyncio.sleep(expected.count % 15)
+        expected_dump = expected.model_dump(by_alias=True, exclude_none=True)
+        await instance.update(session, source={"status": expected_dump})
+
+    @staticmethod
+    async def _aggregate_ssh_public_key_data(
+        session: AsyncSession,
+        instance: GPUInstance,
+    ) -> str:
+        parts: List[str] = []
+        for ref in instance.spec.ssh_public_keys or []:
+            key = await GPUInstanceSSHPublicKey.first_by_fields(
+                session,
+                fields={
+                    "owner_principal_id": instance.owner_principal_id,
+                    "name": ref.name,
+                },
+            )
+            if key is None:
+                raise RuntimeError(
+                    f"GPU instance SSH public key '{ref.name}' not found"
+                )
+            parts.append(key.spec.data)
+        return "\n".join(parts)
