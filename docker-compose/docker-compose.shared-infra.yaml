@@ -19,6 +19,10 @@ services:
     image: ${IMAGE_REGISTRY:-docker.io}/${IMAGE_NAMESPACE:-gpustack}/gpustack:${GPUSTACK_TAG:-latest}
     container_name: gpustack-server
     restart: unless-stopped
+    # Resolve host.docker.internal -> host machine (needed when MySQL runs on the
+    # host OS, not in a container). DB_HOST=host.docker.internal in .env.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       # --- Shared DB (disables builtin Postgres) ---
       - GPUSTACK_DATABASE_URL=${DB_SCHEME:-mysql}://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
