@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, ClassVar, List
 
 from pydantic import ConfigDict, BaseModel
 from sqlalchemy import UniqueConstraint, Column, Integer, ForeignKey
@@ -8,6 +8,9 @@ from gpustack.mixins import BaseModelMixin
 from gpustack.schemas.common import (
     pydantic_camel_case_generator,
     pydantic_column_type,
+    ListParams,
+    PublicFields,
+    PaginatedList,
 )
 
 
@@ -21,7 +24,7 @@ class GPUInstanceSSHPublicKeySpec(BaseModel):
         populate_by_name=True,
     )
 
-    data: Optional[str] = None
+    data: str
     """
     The GPU instance SSH public key data,
     typically in OpenSSH format (e.g., "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC...").
@@ -40,8 +43,8 @@ class GPUInstanceSSHPublicKeyBase(SQLModel):
     )
 
     # For tenant scope.
-    # Every SSH Public Key belongs to one Org. The route layer fills this with
-    # ctx.current_principal_id (or PLATFORM_PRINCIPAL_ID for admin).
+    # Every object belongs to one Org. The route layer fills this with
+    # ctx.current_principal_id (or platform_principal_id for admin).
     owner_principal_id: Optional[int] = Field(
         default=None,
         sa_column=Column(
@@ -51,18 +54,10 @@ class GPUInstanceSSHPublicKeyBase(SQLModel):
         ),
     )
 
-    name: str = Field(
-        max_length=253,
-    )
-    """
-    Name of the GPU instance SSH public key.
-    Must be unique in the scope of the owning principal.
-    """
-
     display_name: Optional[str] = Field(
         nullable=True,
         default=None,
-        max_length=64,
+        max_length=63,
     )
     """
     Display name of the GPU instance SSH public key, for easier identification by users.
@@ -77,15 +72,17 @@ class GPUInstanceSSHPublicKeyBase(SQLModel):
     Description of the GPU instance SSH public key.
     """
 
-    spec: Optional[GPUInstanceSSHPublicKeySpec] = Field(
+    spec: GPUInstanceSSHPublicKeySpec = Field(
         sa_type=pydantic_column_type(GPUInstanceSSHPublicKeySpec),
-        default=None,
     )
+    """
+    Spec for the GPU instance SSH public key, containing the key data and related information.
+    """
 
 
 class GPUInstanceSSHPublicKey(GPUInstanceSSHPublicKeyBase, BaseModelMixin, table=True):
     """
-    Represents an SSH public key associated with a GPU instance.
+    Represents a GPU Instance SSH public key.
     """
 
     __tablename__ = 'gpu_instance_ssh_public_keys'
@@ -102,35 +99,51 @@ class GPUInstanceSSHPublicKey(GPUInstanceSSHPublicKeyBase, BaseModelMixin, table
     )
     id: Optional[int] = Field(default=None, primary_key=True)
 
+    name: str = Field(
+        max_length=63,
+    )
+    """
+    Name of the GPU instance SSH public key.
+    Must be unique in the scope of the owning principal.
+    """
+
 
 class GPUInstanceSSHPublicKeyUpdate(GPUInstanceSSHPublicKeyBase):
     """
     Represents the fields that can be updated for a GPU instance SSH public key.
     """
 
-    name: Optional[str] = None
+    pass
+
+
+class GPUInstanceSSHPublicKeyCreate(GPUInstanceSSHPublicKeyBase):
     """
-    Updated name of the GPU instance SSH public key. Must be unique if provided.
+    Represents the fields required to create a new GPU instance SSH public key.
     """
 
-    display_name: Optional[str] = None
+    name: str
     """
-    Updated display name of the GPU instance SSH public key.
-    """
-
-    description: Optional[str] = None
-    """
-    Updated description of the GPU instance SSH public key.
-    """
-
-    spec: Optional[GPUInstanceSSHPublicKeySpec] = None
-    """
-    Updated specification for the GPU instance SSH public key.
+    Created name of the GPU instance SSH public key.
+    Must be unique in the scope of the owning principal.
     """
 
 
-class GPUInstanceSSHPublicKeyPublic(GPUInstanceSSHPublicKeyBase):
+class GPUInstanceSSHPublicKeyPublic(GPUInstanceSSHPublicKeyCreate, PublicFields):
     """
     Represents the public view of a GPU instance SSH public key,
     containing only fields that are safe to expose to clients.
     """
+
+    pass
+
+
+class GPUInstanceSSHPublicKeyListParams(ListParams):
+    sortable_fields: ClassVar[List[str]] = [
+        "id",
+        "name",
+        "created_at",
+        "updated_at",
+    ]
+
+
+GPUInstanceSSHPublicKeysPublic = PaginatedList[GPUInstanceSSHPublicKeyPublic]

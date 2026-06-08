@@ -50,6 +50,7 @@ class RouteTargetResolution(NamedTuple):
 
     model_id: int
     overridden_model_name: Optional[str]
+    weight: int
 
 
 class UserService:
@@ -79,15 +80,17 @@ class UserService:
         # through the legacy parameter name so OAuth2 password
         # callers don't need to know about the rename.
         #
-        # ``cluster`` / ``worker`` are eager-loaded here because the
-        # auth deps (``get_cluster_principal`` / ``get_worker_principal``)
-        # use them to discriminate which infra row a SYSTEM principal
-        # represents — without the load, the inverse-FK relationship
-        # would be NoLoad and the discriminator would always see None.
-        result = await User.one_by_field(
+        # Scoped to ``kind == USER``: login is USER-only, and since USER
+        # now has its own name partition a same-named ORG must not be
+        # returned here (it would otherwise shadow a real user login).
+        # Persisted SYSTEM principals never reach this path — they
+        # authenticate via API token (``get_by_id``) or in-memory.
+        #
+        # ``cluster`` / ``worker`` are eager-loaded for parity with
+        # ``get_by_id``; for a USER row they resolve to None.
+        result = await User.one_by_fields(
             self.session,
-            "name",
-            username,
+            {"name": username, "kind": PrincipalType.USER},
             options=[selectinload(User.cluster), selectinload(User.worker)],
         )
         if result is None:
@@ -671,10 +674,41 @@ class ModelRouteService:
             RouteTargetResolution(
                 model_id=target.model_id,
                 overridden_model_name=target.overridden_model_name,
+                weight=target.weight,
             )
             for target in targets
             if target.model_id is not None
         ]
+
+    @locked_cached()
+    async def get_by_name(self, name: str) -> Optional[ModelRoute]:
+        """Resolve a request model name to its ``ModelRoute`` row.
+
+        Mirrors the ``<owner-name>/<route>`` prefix handling from
+        :meth:`get_model_auth_info_by_name` so the OpenAI proxy can
+        attribute requests to the route they entered through regardless
+        of whether Higress's ``modelMapping`` has rewritten the name yet.
+        """
+        if "/" in name:
+            owner_name, _, rest = name.partition("/")
+            if rest:
+                owner = (
+                    await self.session.exec(
+                        select(Principal).where(
+                            Principal.name == owner_name,
+                            Principal.kind == PrincipalType.ORG,
+                            Principal.deleted_at.is_(None),
+                        )
+                    )
+                ).first()
+                if owner is not None:
+                    route = await ModelRoute.one_by_fields(
+                        self.session,
+                        {"name": rest, "owner_principal_id": owner.id},
+                    )
+                    if route is not None:
+                        return route
+        return await ModelRoute.one_by_field(self.session, "name", name)
 
     async def update(
         self,
@@ -689,6 +723,7 @@ class ModelRouteService:
         for name in names:
             await delete_cache_by_key(self.get_model_auth_info_by_name, name)
             await delete_cache_by_key(self.resolve_route_targets, name)
+            await delete_cache_by_key(self.get_by_name, name)
         return result
 
     async def delete(self, model_route: ModelRoute, auto_commit: bool = True):
@@ -700,6 +735,7 @@ class ModelRouteService:
         for name in names:
             await delete_cache_by_key(self.get_model_auth_info_by_name, name)
             await delete_cache_by_key(self.resolve_route_targets, name)
+            await delete_cache_by_key(self.get_by_name, name)
         return result
 
 

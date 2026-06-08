@@ -54,7 +54,9 @@ Logical groups, run in order:
 12. Backfill ``model_route_principals`` from the legacy
     ``usermodelroutelink`` table (USER-kind principal_id == user.id
     after rename).
-13. Extend ``accesspolicyenum`` with ``ALLOWED_PRINCIPALS`` and ``ORG``.
+13. Recreate ``accesspolicyenum`` as {PUBLIC, AUTHED,
+    ALLOWED_PRINCIPALS}, folding the released ``ALLOWED_USERS`` into
+    ``ALLOWED_PRINCIPALS`` and converting existing rows.
 14. Drop the legacy ``usermodelroutelink`` table.
 15. Extract login credentials into ``user_passwords`` and drop
     ``hashed_password`` / ``require_password_change`` from
@@ -78,6 +80,8 @@ import gpustack  # noqa: F401  (keeps SQLModel registrations side-effect-loaded)
 import gpustack.utils.sql_enum as sql_enum
 from gpustack.migrations.utils import column_exists, table_exists
 from gpustack.schemas.principals import (
+    AUTHENTICATED_PRINCIPAL_DISPLAY_NAME,
+    AUTHENTICATED_PRINCIPAL_NAME,
     AuthProviderEnum,
     PLATFORM_PRINCIPAL_NAME,
 )
@@ -164,6 +168,91 @@ def _existing_auth_provider_enum(bind):
             AuthProviderEnum, name='authproviderenum', create_type=False
         )
     return sa.Enum(AuthProviderEnum, name='authproviderenum')
+
+
+def _consolidate_access_policy_enum(bind):
+    """Make ``ALLOWED_PRINCIPALS`` the single "specific grants" policy.
+
+    The released ``ALLOWED_USERS`` is folded into ``ALLOWED_PRINCIPALS``
+    — a USER-kind grant resolves identically — and existing rows on both
+    ``models`` and ``model_routes`` are converted.
+
+    The enum is recreated with the final value set, NOT
+    ``ALTER TYPE ... ADD VALUE`` + ``UPDATE``: on PostgreSQL a freshly
+    added enum label is unusable in the transaction that added it, and
+    committing it mid-migration (an autocommit block) would break this
+    migration's atomicity — it runs as part of one big transaction, so a
+    later failure must roll the whole thing back. The recreate is plain
+    transactional DDL. ``accesspolicyenum`` is shared by
+    ``models.access_policy`` and ``model_routes.access_policy`` (both
+    NOT NULL DEFAULT 'AUTHED'), so both columns convert in one pass; the
+    ``USING`` cast remaps ALLOWED_USERS and every other value passes
+    through unchanged.
+    """
+    dialect = bind.dialect.name
+    targets = [t for t in ('models', 'model_routes') if table_exists(t)]
+
+    if dialect == 'postgresql':  # also openGauss (PG-compatible dialect)
+        # The column DEFAULT is typed against the old enum; drop it
+        # before the swap and restore it after.
+        for table in targets:
+            bind.execute(
+                sa.text(
+                    f"ALTER TABLE {table} ALTER COLUMN access_policy DROP DEFAULT"
+                )
+            )
+        bind.execute(
+            sa.text(
+                "CREATE TYPE accesspolicyenum_new AS ENUM "
+                "('PUBLIC', 'AUTHED', 'ALLOWED_PRINCIPALS')"
+            )
+        )
+        for table in targets:
+            bind.execute(
+                sa.text(
+                    f"ALTER TABLE {table} ALTER COLUMN access_policy TYPE "
+                    "accesspolicyenum_new USING ("
+                    "CASE WHEN access_policy::text = 'ALLOWED_USERS' "
+                    "THEN 'ALLOWED_PRINCIPALS' ELSE access_policy::text END"
+                    ")::accesspolicyenum_new"
+                )
+            )
+        bind.execute(sa.text("DROP TYPE accesspolicyenum"))
+        bind.execute(
+            sa.text("ALTER TYPE accesspolicyenum_new RENAME TO accesspolicyenum")
+        )
+        for table in targets:
+            bind.execute(
+                sa.text(
+                    f"ALTER TABLE {table} ALTER COLUMN access_policy "
+                    "SET DEFAULT 'AUTHED'"
+                )
+            )
+    elif dialect == 'mysql':  # also OceanBase (MySQL-compatible dialect)
+        # Inline ENUM per column (no shared type). Widen to admit
+        # ALLOWED_PRINCIPALS, remap the data, then narrow to the final
+        # set. MySQL DDL auto-commits, so there's no in-transaction
+        # restriction to work around.
+        wide = (
+            "ENUM('PUBLIC', 'AUTHED', 'ALLOWED_USERS', 'ALLOWED_PRINCIPALS') "
+            "NOT NULL DEFAULT 'AUTHED'"
+        )
+        final = (
+            "ENUM('PUBLIC', 'AUTHED', 'ALLOWED_PRINCIPALS') NOT NULL DEFAULT 'AUTHED'"
+        )
+        for table in targets:
+            bind.execute(
+                sa.text(f"ALTER TABLE {table} MODIFY COLUMN access_policy {wide}")
+            )
+            bind.execute(
+                sa.text(
+                    f"UPDATE {table} SET access_policy = 'ALLOWED_PRINCIPALS' "
+                    "WHERE access_policy = 'ALLOWED_USERS'"
+                )
+            )
+            bind.execute(
+                sa.text(f"ALTER TABLE {table} MODIFY COLUMN access_policy {final}")
+            )
 
 
 def upgrade() -> None:
@@ -346,18 +435,21 @@ def upgrade() -> None:
             ondelete='CASCADE',
         )
 
-    # ``principals.name`` uniqueness is partitioned by kind:
-    # - GROUP has its own namespace — IdP-supplied group names
-    #   commonly coincide with admin-chosen Org names; forcing the
-    #   two to be globally unique would break OIDC/SAML group sync
-    #   the moment an admin happens to name an Org the same as an
-    #   IdP group.
-    # - USER / ORG / SYSTEM share one namespace — admin-curated kinds
-    #   that have always shared one. Most lookups already scope by
-    #   kind (platform-Org resolution, default-cluster SYSTEM
-    #   resolution, the ``<owner-name>/<route>`` URL resolver), but
-    #   ``get_by_username`` (login) does not and relies on this
-    #   shared partition to avoid mis-resolving a login to an ORG row.
+    # ``principals.name`` uniqueness is partitioned by kind: USER, ORG,
+    # and GROUP each get their own independent name namespace.
+    # - USER is carved out so an admin-created Org and a (manually- or
+    #   IdP-provisioned) User may share a name. USER names never appear
+    #   in the ``<owner-name>/<route>`` inference URL (personal Orgs —
+    #   which are USER principals — don't deploy), and login lookups
+    #   (``get_by_username`` / IdP provisioning) are kind-scoped to USER,
+    #   so a same-named ORG can no longer be mis-resolved as a login.
+    # - GROUP has always had its own namespace — IdP-supplied group
+    #   names commonly coincide with admin-chosen Org names, and forcing
+    #   the two globally unique would break OIDC/SAML group sync.
+    # - SYSTEM gets no partial unique index: its rows are internally
+    #   generated (``system/cluster-<id>`` / ``system/worker-<id>``), so
+    #   they're structurally unique with no user-facing create path, and
+    #   the ``SYSTEM`` enum value doesn't even exist until step 17a.
     #
     # Postgres supports partial unique indexes natively. MySQL has
     # no equivalent — fall back to a single plain (non-unique) index
@@ -365,16 +457,12 @@ def upgrade() -> None:
     # enforced by the create routes (``create_user`` /
     # ``create_organization`` / ``_insert_group_or_refetch``).
     if dialect == 'postgresql':
-        op.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS uix_principals_non_group_name "
-            "ON principals (name) "
-            "WHERE kind <> 'GROUP' AND deleted_at IS NULL"
-        )
-        op.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS uix_principals_group_name "
-            "ON principals (name) "
-            "WHERE kind = 'GROUP' AND deleted_at IS NULL"
-        )
+        for kind in ('USER', 'ORG', 'GROUP'):
+            op.execute(
+                f"CREATE UNIQUE INDEX IF NOT EXISTS uix_principals_{kind.lower()}_name "
+                "ON principals (name) "
+                f"WHERE kind = '{kind}' AND deleted_at IS NULL"
+            )
     else:
         op.create_index('ix_principals_name', 'principals', ['name'])
 
@@ -569,15 +657,18 @@ def upgrade() -> None:
         batch_op.alter_column(
             'owner_principal_id', existing_type=sa.Integer(), nullable=False
         )
-        # Unique scope was (user_id, name); add owner_principal_id so the
-        # same key name can coexist across owner namespaces.
-        try:
-            batch_op.drop_constraint('uix_user_id_name', type_='unique')
-        except Exception:
-            pass
+        # Unique scope was (user_id, name); widen to
+        # (user_id, owner_principal_id, name) so the same key name can
+        # coexist across owner namespaces. The new index must be created
+        # BEFORE dropping the old one: on MySQL/OceanBase the old unique
+        # index is the only thing satisfying the user_id FK index
+        # requirement; dropping it first errors with "needed in a foreign
+        # key constraint". The new composite keeps ``user_id`` as the
+        # leftmost prefix so it can take over that role.
         batch_op.create_unique_constraint(
             'uix_user_owner_name', ['user_id', 'owner_principal_id', 'name']
         )
+        batch_op.drop_constraint('uix_user_id_name', type_='unique')
         batch_op.create_foreign_key(
             'fk_api_keys_owner_principal_id_principals',
             'principals',
@@ -652,10 +743,17 @@ def upgrade() -> None:
                 nullable=False,
             )
 
-    # At most one default cluster per principal. Partial unique covers
-    # active rows only (excluding soft-deleted), letting a principal
-    # "rotate" defaults by soft-deleting the old + flipping the new
-    # without conflict.
+    # At most one default cluster per principal. Postgres expresses
+    # this as a partial unique on the active (non-soft-deleted, default)
+    # rows so a principal can "rotate" defaults by soft-deleting the
+    # old + flipping the new without conflict. MySQL/OceanBase have
+    # no partial-index equivalent — fall back to a composite
+    # (owner_principal_id, is_default) index that speeds up the
+    # default-cluster lookup. A plain (owner_principal_id) index
+    # would be redundant with the FK's auto-created index. Uniqueness
+    # is enforced by the cluster routes (``create_cluster`` only
+    # auto-defaults when none exist; ``set_default_cluster`` unsets
+    # prior defaults first).
     if dialect == 'postgresql':
         op.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS uix_clusters_default_per_owner "
@@ -663,10 +761,10 @@ def upgrade() -> None:
             "WHERE is_default = true AND deleted_at IS NULL"
         )
     else:
-        op.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS uix_clusters_default_per_owner "
-            "ON clusters (owner_principal_id) "
-            "WHERE is_default = 1 AND deleted_at IS NULL"
+        op.create_index(
+            'ix_clusters_default_per_owner',
+            'clusters',
+            ['owner_principal_id', 'is_default'],
         )
 
     # ------------------------------------------------------------------
@@ -697,6 +795,65 @@ def upgrade() -> None:
                     ondelete='SET NULL',
                 )
 
+    # model_usages also needs a consumer-side tenant pointer for "usage made
+    # with this Org's API keys" views. It intentionally differs from
+    # owner_principal_id when Org A calls a deployment shared by Org B.
+    if not column_exists('model_usages', 'consumer_principal_id'):
+        with op.batch_alter_table('model_usages', schema=None) as batch_op:
+            batch_op.add_column(
+                sa.Column('consumer_principal_id', sa.Integer(), nullable=True)
+            )
+            batch_op.create_foreign_key(
+                'fk_model_usages_consumer_principal_id_principals',
+                'principals',
+                ['consumer_principal_id'],
+                ['id'],
+                ondelete='SET NULL',
+            )
+            batch_op.create_index(
+                'ix_model_usages_consumer_principal_id',
+                ['consumer_principal_id'],
+                unique=False,
+            )
+
+    for tbl in (
+        'model_usages',
+        'model_usage_details',
+        'model_usage_details_archive',
+    ):
+        if not table_exists(tbl) or not column_exists(tbl, 'consumer_principal_id'):
+            continue
+        if dialect == 'mysql':
+            op.execute(
+                sa.text(
+                    f"""
+                    UPDATE {tbl} mu
+                    JOIN api_keys ak ON ak.access_key = mu.access_key
+                    SET mu.consumer_principal_id = ak.owner_principal_id
+                    WHERE mu.consumer_principal_id IS NULL
+                    """
+                )
+            )
+        else:
+            op.execute(
+                sa.text(
+                    f"""
+                    UPDATE {tbl}
+                    SET consumer_principal_id = (
+                        SELECT api_keys.owner_principal_id
+                        FROM api_keys
+                        WHERE api_keys.access_key = {tbl}.access_key
+                    )
+                    WHERE consumer_principal_id IS NULL
+                      AND EXISTS (
+                        SELECT 1
+                        FROM api_keys
+                        WHERE api_keys.access_key = {tbl}.access_key
+                      )
+                    """
+                )
+            )
+
     # model_files only had worker_id; add cluster_id for direct
     # cluster_access-based filtering.
     if not column_exists('model_files', 'cluster_id'):
@@ -713,6 +870,62 @@ def upgrade() -> None:
     # globally unique — composite unique on (backend_name, owner_principal_id)
     # lets each owner carry their own row alongside the Platform row.
     if not column_exists('inference_backends', 'owner_principal_id'):
+        # Drop the stale unique-on-backend_name objects up-front using
+        # eager DDL — ``batch_alter_table`` flushes lazily on __exit__, so
+        # a try/except around a batch op can't catch "key doesn't exist"
+        # errors at the right point. Going through the catalog directly
+        # also sidesteps SQLAlchemy inspector inconsistencies (notably,
+        # on MySQL/OceanBase neither ``get_unique_constraints`` nor
+        # ``get_indexes`` reliably reports the explicit unique index
+        # ``ix_inference_backends_backend_name``).
+        if dialect == 'postgresql':
+            # Find single-column unique constraints whose column is
+            # ``backend_name``. ``conkey`` is a 1-based attnum array;
+            # avoid ``WITH ORDINALITY`` and set-returning functions in
+            # the predicate so this also runs on openGauss.
+            for name_row in bind.execute(
+                sa.text(
+                    "SELECT c.conname FROM pg_constraint c "
+                    "JOIN pg_class t ON t.oid = c.conrelid "
+                    "WHERE t.relname = 'inference_backends' "
+                    "AND c.contype = 'u' "
+                    "AND array_length(c.conkey, 1) = 1 "
+                    "AND (SELECT a.attname FROM pg_attribute a "
+                    "     WHERE a.attrelid = c.conrelid "
+                    "     AND a.attnum = c.conkey[1]) = 'backend_name'"
+                )
+            ):
+                op.execute(
+                    f'ALTER TABLE inference_backends '
+                    f'DROP CONSTRAINT IF EXISTS "{name_row[0]}"'
+                )
+            op.execute(
+                "DROP INDEX IF EXISTS ix_inference_backends_backend_name"
+            )
+        else:
+            # MySQL/OceanBase: every unique object on backend_name is
+            # backed by a unique index — drop them all from
+            # information_schema. NON_UNIQUE = 0 picks unique-only;
+            # exclude PRIMARY just in case.
+            unique_idx_names = [
+                row[0]
+                for row in bind.execute(
+                    sa.text(
+                        "SELECT DISTINCT INDEX_NAME FROM "
+                        "information_schema.STATISTICS "
+                        "WHERE TABLE_SCHEMA = DATABASE() "
+                        "AND TABLE_NAME = 'inference_backends' "
+                        "AND COLUMN_NAME = 'backend_name' "
+                        "AND NON_UNIQUE = 0 "
+                        "AND INDEX_NAME <> 'PRIMARY'"
+                    )
+                )
+            ]
+            for name in unique_idx_names:
+                op.execute(
+                    f"ALTER TABLE inference_backends DROP INDEX `{name}`"
+                )
+
         with op.batch_alter_table('inference_backends', schema=None) as batch_op:
             batch_op.add_column(
                 sa.Column('owner_principal_id', sa.Integer(), nullable=True)
@@ -724,16 +937,6 @@ def upgrade() -> None:
                 ['id'],
                 ondelete='CASCADE',
             )
-            try:
-                batch_op.drop_constraint(
-                    'inference_backends_backend_name_key', type_='unique'
-                )
-            except Exception:
-                pass
-            try:
-                batch_op.drop_index('ix_inference_backends_backend_name')
-            except Exception:
-                pass
             batch_op.create_unique_constraint(
                 'uix_inference_backends_name_owner',
                 ['backend_name', 'owner_principal_id'],
@@ -772,22 +975,15 @@ def upgrade() -> None:
         )
 
     # ------------------------------------------------------------------
-    # 14. Extend access_policy enum.
+    # 14. Consolidate access_policy -> ALLOWED_PRINCIPALS.
     # ------------------------------------------------------------------
-    # ORG = scoped to members of the route's owning Organization (default
-    # for non-platform Org routes). ALLOWED_PRINCIPALS = explicit per-user
-    # / group / org grants via model_route_principals. ALLOWED_USERS
-    # stays as the OSS-facing per-user-only policy; rows are stored
-    # alongside ALLOWED_PRINCIPALS rows in the unified principals table.
-    access_policy_enum = sa.Enum(
-        'PUBLIC', 'AUTHED', 'ALLOWED_USERS', name='accesspolicyenum'
-    )
-    sql_enum.add_enum_values(
-        {'model_routes': 'access_policy'},
-        access_policy_enum,
-        'ALLOWED_PRINCIPALS',
-        'ORG',
-    )
+    # ALLOWED_PRINCIPALS is the single "specific grants" policy: explicit
+    # per-user / group / org grants via model_route_principals, and the
+    # team-private default for non-platform Org routes (owning Org
+    # auto-granted on create). It subsumes the released ``ALLOWED_USERS``
+    # (a USER-kind grant resolves identically); the enum is recreated
+    # without that label and existing rows are converted.
+    _consolidate_access_policy_enum(bind)
 
     # ------------------------------------------------------------------
     # 15. Drop legacy usermodelroutelink.
@@ -978,13 +1174,36 @@ def upgrade() -> None:
     # The column drops trip a "depends on" error unless the FK
     # constraints are dropped first, and the constraint names came
     # from the v2.0 migration with shapes like ``fk_users_cluster_id``
-    # (not the autogen ``fk_principals_*`` template). Read the live
-    # FK names off the table via inspector so the upgrade survives
-    # whatever historical migration named them.
+    # (not the autogen ``fk_principals_*`` template). Discover the
+    # live FK names off the columns we're about to drop, so the
+    # upgrade survives whatever historical migration named them.
+    # The SQLAlchemy inspector has been observed to miss FKs on
+    # OceanBase, so on MySQL-family dialects we also query
+    # ``information_schema.KEY_COLUMN_USAGE`` directly and union the
+    # results.
+    fk_names_to_drop = set()
     inspector = sa.inspect(bind)
     for fk in inspector.get_foreign_keys('principals'):
-        if fk.get('referred_table') in ('clusters', 'workers'):
-            op.drop_constraint(fk['name'], 'principals', type_='foreignkey')
+        cols = fk.get('constrained_columns') or []
+        if fk.get('name') and any(
+            c in ('cluster_id', 'worker_id') for c in cols
+        ):
+            fk_names_to_drop.add(fk['name'])
+    if dialect == 'mysql':
+        for row in bind.execute(
+            sa.text(
+                "SELECT DISTINCT CONSTRAINT_NAME "
+                "FROM information_schema.KEY_COLUMN_USAGE "
+                "WHERE TABLE_SCHEMA = DATABASE() "
+                "AND TABLE_NAME = 'principals' "
+                "AND REFERENCED_TABLE_NAME IS NOT NULL "
+                "AND COLUMN_NAME IN ('cluster_id', 'worker_id')"
+            )
+        ):
+            fk_names_to_drop.add(row[0])
+
+    for name in fk_names_to_drop:
+        op.drop_constraint(name, 'principals', type_='foreignkey')
 
     with op.batch_alter_table('principals', schema=None) as batch_op:
         if column_exists('principals', 'cluster_id'):
@@ -1001,11 +1220,93 @@ def upgrade() -> None:
     # by historical migrations would re-fail on a future ``alembic
     # downgrade``; an orphaned enum type is harmless.
 
+    # ------------------------------------------------------------------
+    # 18. Seed ``system/authenticated`` + backfill Default-Org grants.
+    # ------------------------------------------------------------------
+    # ``system/authenticated`` is the built-in GROUP principal that
+    # ``_accessible_clusters`` treats as implicitly containing every
+    # authenticated caller. A ``cluster_access`` row granting it is
+    # therefore a global grant.
+    #
+    # Default-Org clusters default to "shared with all users" — the
+    # ``create_cluster`` route now seeds that row at create time. Here
+    # we cover the upgrade case: every Default-Org cluster that
+    # pre-dates this revision gets the same row, idempotent via the
+    # ``NOT EXISTS`` guard and the composite UNIQUE on
+    # ``(cluster_id, principal_id)``.
+
+    # 18a. Seed the GROUP principal. Lives in the GROUP name
+    # partition (its own partial uniqueness index, set up above), so
+    # it can't collide with the admin-curated USER / ORG / SYSTEM rows
+    # in the other partition.
+    op.execute(
+        sa.text(
+            f"""
+            INSERT INTO principals
+                (kind, name, display_name, description,
+                 is_admin, is_active,
+                 source,
+                 created_at, updated_at, deleted_at)
+            SELECT
+                'GROUP', :name, :display_name, :desc,
+                {bool_false}, {bool_true},
+                'Local',
+                CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, NULL
+            WHERE NOT EXISTS (
+                SELECT 1 FROM principals
+                WHERE kind = 'GROUP' AND name = :name
+            )
+            """
+        ).bindparams(
+            name=AUTHENTICATED_PRINCIPAL_NAME,
+            display_name=AUTHENTICATED_PRINCIPAL_DISPLAY_NAME,
+            desc=(
+                'Built-in group containing every authenticated principal. '
+                'Grant access to this principal to share a resource with all users.'
+            ),
+        )
+    )
+
+    authenticated_id = bind.execute(
+        sa.text(
+            "SELECT id FROM principals "
+            "WHERE kind = 'GROUP' AND name = :name AND deleted_at IS NULL"
+        ).bindparams(name=AUTHENTICATED_PRINCIPAL_NAME)
+    ).scalar()
+    if authenticated_id is None:
+        raise RuntimeError(
+            f"Authenticated principal not found by name="
+            f"{AUTHENTICATED_PRINCIPAL_NAME!r} after seed; "
+            "backfill cannot continue"
+        )
+
+    # 18b. Backfill ``cluster_access`` rows for every existing
+    # Default-Org cluster. ``platform_id`` was resolved in step 3.
+    op.execute(
+        sa.text(
+            """
+            INSERT INTO cluster_access
+                (cluster_id, principal_id, granted_by,
+                 created_at, updated_at, deleted_at)
+            SELECT c.id, :authenticated_id, NULL,
+                   CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, NULL
+            FROM clusters c
+            WHERE c.owner_principal_id = :platform_id
+              AND c.deleted_at IS NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM cluster_access ca
+                WHERE ca.cluster_id = c.id
+                  AND ca.principal_id = :authenticated_id
+              )
+            """
+        ).bindparams(
+            authenticated_id=authenticated_id,
+            platform_id=platform_id,
+        )
+    )
+
 
 def downgrade() -> None:
-    bind = op.get_bind()
-    dialect = bind.dialect.name
-
     # Splitting principals back into a USER-only ``users`` table is not
     # mechanical: ORG/GROUP rows have ids in the same space as the
     # original users, and FK definitions on legacy tables (api_keys,

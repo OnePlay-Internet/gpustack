@@ -72,6 +72,33 @@ class AuthProviderEnum(str, Enum):
 # resources default to it.
 PLATFORM_PRINCIPAL_NAME = 'default'
 
+# Canonical ``name`` of the built-in "all authenticated users" group
+# principal. Shares the ``system/`` reserved prefix with
+# ``system/cluster-…`` / ``system/worker-…`` so every built-in
+# reserved-name principal follows one convention. Every authenticated
+# request is treated as a member of this group at auth-context
+# resolution time, without a backing ``principal_memberships`` row.
+# ClusterAccess (and any future ACL table) can grant to this
+# principal_id, and the grant takes effect for every authenticated
+# user. Lazy-seeded on server startup by
+# :func:`init_authenticated_principal_id` so no schema migration is
+# required.
+AUTHENTICATED_PRINCIPAL_NAME = 'system/authenticated'
+AUTHENTICATED_PRINCIPAL_DISPLAY_NAME = 'All Authenticated Users'
+
+# Names starting with this prefix are reserved for internal /
+# built-in principals (``system/cluster-…``, ``system/worker-…``,
+# ``system/authenticated``). Group-CRUD routes hide and lock these
+# rows so admins can't accidentally rename / delete them; cluster_access
+# / ACL surfaces continue to render them for revoke flows.
+RESERVED_PRINCIPAL_NAME_PREFIX = 'system/'
+
+
+def is_reserved_principal_name(name: Optional[str]) -> bool:
+    """Return True if ``name`` is in the reserved built-in namespace."""
+    return bool(name) and name.startswith(RESERVED_PRINCIPAL_NAME_PREFIX)
+
+
 # Module-private mutable resolved at server startup by
 # :func:`init_platform_principal_id`. Used to be exported as
 # ``PLATFORM_PRINCIPAL_ID`` (a hardcoded ``1`` baked into schema
@@ -83,6 +110,7 @@ PLATFORM_PRINCIPAL_NAME = 'default'
 # the runtime update. Underscore prefix discourages that import path;
 # every reader goes through :func:`platform_principal_id`.
 _PLATFORM_PRINCIPAL_ID: int = 1
+_AUTHENTICATED_PRINCIPAL_ID: int = 0
 
 
 def platform_principal_id() -> int:
@@ -94,6 +122,17 @@ def platform_principal_id() -> int:
     ``_PLATFORM_PRINCIPAL_ID`` directly.
     """
     return _PLATFORM_PRINCIPAL_ID
+
+
+def authenticated_principal_id() -> int:
+    """Sync getter for the ``system/authenticated`` group principal id.
+
+    Used by ``_accessible_clusters`` (and any future ACL resolver) to
+    union grants written against this group with the caller's direct /
+    group / org grants — every authenticated principal is an implicit
+    member, so the row applies universally.
+    """
+    return _AUTHENTICATED_PRINCIPAL_ID
 
 
 # Public alias for ``default_factory=`` on SQLModel fields. Identical
@@ -161,21 +200,28 @@ class PrincipalBase(SQLModel):
         sa_column=Column(SQLEnum(PrincipalType), nullable=False),
     )
 
-    # Stable identifier for the principal. Uniqueness is partitioned:
-    # GROUP has its own namespace; USER / ORG / SYSTEM share one. The
-    # GROUP partition exists because IdP-supplied group names commonly
-    # coincide with admin-chosen Org names — forcing them globally
-    # unique would break OIDC/SAML group sync the moment an admin
-    # happens to name an Org the same as an IdP group. The shared
-    # namespace for the admin-curated kinds is conservative: most
-    # name lookups already scope by kind (``init_platform_principal_id``
-    # → ORG, ``get_default_cluster_principal`` → SYSTEM, the
-    # ``<owner-name>/<route>`` URL resolver → ORG), but
-    # ``get_by_username`` (login) does not, and relies on USER / ORG /
-    # SYSTEM not colliding to avoid mis-resolving a login to an ORG
-    # row. Matches the k8s convention where ``metadata.name`` is the
-    # URL-safe identifier — the upcoming GPU service API and k8s
-    # namespace plumbing both key off this column directly.
+    # Stable identifier for the principal. Uniqueness is partitioned per
+    # kind: USER / ORG / GROUP each have their own independent name
+    # namespace, so the same ``name`` may exist once per kind (e.g. an
+    # admin Org "acme" and a user "acme" can coexist).
+    #   * GROUP is partitioned because IdP-supplied group names commonly
+    #     coincide with admin-chosen Org names — forcing them globally
+    #     unique would break OIDC/SAML group sync.
+    #   * USER is partitioned because USER names never appear in the
+    #     ``<owner-name>/<route>`` inference URL (personal Orgs, which are
+    #     USER principals, don't deploy), so they need not be unique
+    #     against ORG. The only login lookups are kind-scoped to USER
+    #     (``get_by_username`` and IdP provisioning), so a same-named ORG
+    #     can never be mis-resolved as a login.
+    #   * SYSTEM has no unique index: its rows are internally generated
+    #     (``system/cluster-<id>`` / ``system/worker-<id>``), structurally
+    #     unique, with no user-facing create path.
+    # Other name lookups already scope by kind
+    # (``init_platform_principal_id`` → ORG,
+    # ``get_default_cluster_principal`` → SYSTEM, the
+    # ``<owner-name>/<route>`` URL resolver → ORG). Matches the k8s
+    # convention where ``metadata.name`` is the URL-safe identifier — the
+    # GPU service API and k8s namespace plumbing both key off this column.
     #
     # * USER: the login name (what the legacy schema called
     #   ``username``). Not used as a URL prefix — USER-owned model
@@ -268,18 +314,25 @@ class Principal(PrincipalBase, BaseModelMixin, table=True):
 
     __tablename__ = 'principals'
     __table_args__ = (
-        # Two partial unique indexes — see the ``name`` field comment
-        # for the partitioning rationale (non-GROUP kinds share one
-        # namespace; GROUP has its own). Both are declared here for
-        # autogenerate parity with the migration. On MySQL the
-        # migration falls back to a single plain (non-unique) index
-        # since partial indexes are unsupported; uniqueness within
-        # each partition is then enforced by the create routes.
+        # One partial unique index per user-facing kind (USER / ORG /
+        # GROUP) — see the ``name`` field comment for the partitioning
+        # rationale. SYSTEM gets no index: its rows are internally
+        # generated and structurally unique. Declared here for
+        # autogenerate parity with the migration. On MySQL the migration
+        # falls back to a single plain (non-unique) index since partial
+        # indexes are unsupported; uniqueness within each partition is
+        # then enforced by the create routes.
         Index(
-            'uix_principals_non_group_name',
+            'uix_principals_user_name',
             'name',
             unique=True,
-            postgresql_where=text("kind <> 'GROUP' AND deleted_at IS NULL"),
+            postgresql_where=text("kind = 'USER' AND deleted_at IS NULL"),
+        ),
+        Index(
+            'uix_principals_org_name',
+            'name',
+            unique=True,
+            postgresql_where=text("kind = 'ORG' AND deleted_at IS NULL"),
         ),
         Index(
             'uix_principals_group_name',
@@ -412,6 +465,7 @@ class PrincipalMembership(PrincipalMembershipBase, BaseModelMixin, table=True):
 # --------------------------------------------------------------------
 
 _PLATFORM_PRINCIPAL_ID_INITIALIZED: bool = False
+_AUTHENTICATED_PRINCIPAL_ID_INITIALIZED: bool = False
 
 
 async def init_platform_principal_id(session: AsyncSession) -> int:
@@ -439,6 +493,30 @@ async def init_platform_principal_id(session: AsyncSession) -> int:
     return p.id
 
 
+async def init_authenticated_principal_id(session: AsyncSession) -> int:
+    """Resolve and bind the ``system/authenticated`` group principal id.
+
+    The row is seeded by the shared-GPU-services migration alongside
+    the cluster_access backfill — same pattern as the platform
+    principal — so this is a read-only resolver. Raises if absent so
+    a missing seed surfaces loudly instead of letting auth-resolution
+    silently widen.
+    """
+    global _AUTHENTICATED_PRINCIPAL_ID, _AUTHENTICATED_PRINCIPAL_ID_INITIALIZED
+    p = await Principal.one_by_fields(
+        session=session,
+        fields={'kind': PrincipalType.GROUP, 'name': AUTHENTICATED_PRINCIPAL_NAME},
+    )
+    if p is None:
+        raise RuntimeError(
+            f"Authenticated principal not found by name="
+            f"{AUTHENTICATED_PRINCIPAL_NAME!r}; database may be uninitialized"
+        )
+    _AUTHENTICATED_PRINCIPAL_ID = p.id
+    _AUTHENTICATED_PRINCIPAL_ID_INITIALIZED = True
+    return p.id
+
+
 async def get_platform_principal_id(session: AsyncSession) -> int:
     """Read the platform principal's id, resolving by name if startup
     init has not been performed yet (tests, scripts).
@@ -448,8 +526,20 @@ async def get_platform_principal_id(session: AsyncSession) -> int:
     return await init_platform_principal_id(session)
 
 
+async def get_authenticated_principal_id(session: AsyncSession) -> int:
+    """Read the ``system/authenticated`` principal id, seeding it on
+    first call. Counterpart to :func:`get_platform_principal_id`.
+    """
+    if _AUTHENTICATED_PRINCIPAL_ID_INITIALIZED:
+        return _AUTHENTICATED_PRINCIPAL_ID
+    return await init_authenticated_principal_id(session)
+
+
 def _reset_platform_principal_for_tests() -> None:
     """Test hook — clears the initialised flag and resets the value."""
     global _PLATFORM_PRINCIPAL_ID, _PLATFORM_PRINCIPAL_ID_INITIALIZED
+    global _AUTHENTICATED_PRINCIPAL_ID, _AUTHENTICATED_PRINCIPAL_ID_INITIALIZED
     _PLATFORM_PRINCIPAL_ID = 1
     _PLATFORM_PRINCIPAL_ID_INITIALIZED = False
+    _AUTHENTICATED_PRINCIPAL_ID = 0
+    _AUTHENTICATED_PRINCIPAL_ID_INITIALIZED = False

@@ -1,7 +1,12 @@
 import re
 from enum import Enum
 from typing import ClassVar, Optional, Dict, Any, List, Set
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field as PydanticField,
+    field_validator,
+    model_validator,
+)
 from sqlmodel import (
     Field,
     Relationship,
@@ -20,7 +25,7 @@ from gpustack.schemas.common import (
     PublicFields,
     ItemList,
 )
-from gpustack.schemas.principals import _platform_principal_id
+from gpustack.schemas.principals import _platform_principal_id, PrincipalType
 
 if TYPE_CHECKING:
     from gpustack.schemas.models import Model
@@ -65,18 +70,35 @@ def effective_route_name(
 class AccessPolicyEnum(str, Enum):
     PUBLIC = "public"
     AUTHED = "authed"
-    # ORG = scoped to members of the route's owning Organization. The
-    # default for new routes in non-platform Orgs — semantically the
-    # "team-private" scope, no principal table involvement.
-    ORG = "org"
-    # Per-user grants. Rows are stored in ``model_route_principals``
-    # with ``principal_id`` pointing at a USER-kind principal.
-    ALLOWED_USERS = "allowed_users"
     # Per-principal grants (user / org / group) via
-    # ``model_route_principals``. Mutually exclusive with
-    # ``ALLOWED_USERS`` — pick the policy whose granularity matches
-    # the deployment's identity model.
+    # ``model_route_principals``. The single "specific grants" policy:
+    #
+    #   * "specific users": grants are USER-kind rows. The OSS UI keeps
+    #     its user-only picker and the ``/access`` endpoint writes this
+    #     policy — for a USER grant the visibility view behaves exactly
+    #     like the released ``allowed_users`` policy it replaces.
+    #   * Org / group grants for the multi-tenant tier, managed via
+    #     ``/principals``.
+    #
+    # Also serves as the "team-private" scope: a new route in a
+    # non-platform Org defaults to ALLOWED_PRINCIPALS with its owning
+    # Org auto-granted (see ``create_model_route``), so the route is
+    # visible to that Org's members and the grant is editable like any
+    # other principal grant.
     ALLOWED_PRINCIPALS = "allowed_principals"
+
+    @classmethod
+    def _missing_(cls, value):
+        # Back-compat for the released v2.1.x OSS API, which used
+        # ``allowed_users`` as a distinct policy. It is folded into
+        # ALLOWED_PRINCIPALS (a USER-kind grant resolves identically)
+        # and stored rows were converted by the multi-tenancy
+        # migration, so the only place the legacy string can still
+        # appear is an older API client's request body — accept and
+        # coerce it instead of 422-ing.
+        if value == "allowed_users":
+            return cls.ALLOWED_PRINCIPALS
+        return None
 
 
 class TargetStateEnum(str, Enum):
@@ -114,6 +136,28 @@ class ModelRouteTargetUpdate(SQLModel):
             nullable=True,
         ),
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_legacy_provider_model_name(cls, data):
+        # Accept the pre-v2.2.0 ``provider_model_name`` key as a
+        # deprecated alias for ``overridden_model_name``. Conflicting
+        # values on both keys are rejected to avoid silent picking.
+        if not isinstance(data, dict) or "provider_model_name" not in data:
+            return data
+        legacy = data.pop("provider_model_name")
+        if "overridden_model_name" in data:
+            canonical = data["overridden_model_name"]
+            if canonical != legacy:
+                raise ValueError(
+                    "Got both 'overridden_model_name' and the legacy alias "
+                    "'provider_model_name' with different values. Drop "
+                    "'provider_model_name' (deprecated) and send only "
+                    "'overridden_model_name'."
+                )
+        else:
+            data["overridden_model_name"] = legacy
+        return data
 
     @field_validator("overridden_model_name", mode="before")
     def validate_overridden_model_name(cls, v):
@@ -381,9 +425,33 @@ class ModelUserAccess(BaseModel):
     # More custom fields can be added here, e.g., quota, rate_limit, etc.
 
 
+class ModelPrincipalRef(BaseModel):
+    principal_type: PrincipalType
+    principal_id: int
+
+
+class ModelPrincipalAccess(ModelPrincipalRef):
+    # Stable name + optional human label from the joined principals row,
+    # so the client can render a grant without a second round trip.
+    principal_name: Optional[str] = None
+    principal_display_name: Optional[str] = None
+
+
 class ModelAuthorizationUpdate(BaseModel):
     access_policy: Optional[AccessPolicyEnum] = None
-    users: List[ModelUserAccess]
+    # ``principals``, when provided, replaces the route's ENTIRE grant
+    # set (any kind — user / org / group) with exactly this list. This is
+    # the unified surface; an empty list clears all grants.
+    principals: Optional[List[ModelPrincipalRef]] = None
+    # ``users`` is the deprecated, released (v2.1.x) per-user surface: it
+    # replaces only the route's USER-kind grants, leaving org / group
+    # grants alone. Ignored when ``principals`` is provided. ``None`` for
+    # both means "don't touch grants" (e.g. a plain policy switch).
+    # Marked deprecated in the schema (no runtime warning — it's read on
+    # every request) to steer clients toward ``principals``.
+    users: Optional[List[ModelUserAccess]] = PydanticField(
+        default=None, json_schema_extra={"deprecated": True}
+    )
 
 
 class ModelUserAccessExtended(ModelUserAccess):
@@ -394,12 +462,20 @@ class ModelUserAccessExtended(ModelUserAccess):
 
 
 class ModelAuthorizationList(ItemList[ModelUserAccessExtended]):
+    # Deprecated USER-only subset, kept for released (v2.1.x) clients.
+    # Prefer ``principals`` (the full grant set). Schema-only deprecation
+    # marker — no runtime warning, since it's read on every response.
+    items: List[ModelUserAccessExtended] = PydanticField(
+        default_factory=list, json_schema_extra={"deprecated": True}
+    )
     # The route's current access_policy is returned alongside the
     # grants list so a single GET refreshes both halves of the
     # Access Settings dialog (some clients open it from a stale list
     # snapshot where the row's policy may not reflect the latest
     # save).
     access_policy: Optional[AccessPolicyEnum] = None
+    # Full grant set (any kind), the unified view going forward.
+    principals: Optional[List[ModelPrincipalAccess]] = None
 
 
 class MyModel(ModelRouteBase, BaseModelMixin, table=True):
@@ -408,6 +484,13 @@ class MyModel(ModelRouteBase, BaseModelMixin, table=True):
     pid: str
     id: int
     user_id: int = Field(default=0)
+    # Records which principal granted this (user, route) row visibility.
+    # NULL on PUBLIC/AUTHED rows (not principal-mediated). The kind is
+    # stored as plain text — see ``model_user_after_create_view_stmt``
+    # for why it isn't the ``principaltype`` enum. Server-side only;
+    # not surfaced via ``MyModelPublic``.
+    via_principal_id: Optional[int] = None
+    via_principal_kind: Optional[str] = None
 
 
 class MyModelPublic(ModelRoutePublic):
