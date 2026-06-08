@@ -1,15 +1,18 @@
-# GPUStack as a pure CONSUMER of shared external infra (MySQL, Prometheus, Grafana).
-# No builtin database, no builtin observability — data lives on the remote host,
-# so pruning/recreating this container never loses data.
+# GPUStack with SHARED external MySQL. Grafana + Prometheus are conditional:
+#   - .env WITHOUT GRAFANA_URL  -> builtin Grafana/Prometheus run in this container
+#   - .env WITH    GRAFANA_URL  -> use that shared Grafana, builtin skipped
+# DB always lives on the remote host, so pruning/recreating this container never
+# loses DB data. Builtin observability data lives in the gpustack-data volume.
 #
 # Usage:
 #   cp .env.shared-infra.example .env
-#   # edit .env with your remote host IP + creds
+#   # edit .env with your remote host IP + creds (leave GRAFANA_URL empty for builtin)
 #   docker compose -f docker-compose.shared-infra.yaml --env-file .env up -d
 #
 # Verify gating in source:
 #   - builtin postgres skipped: gpustack/cmd/prerun.py:87  (if not cfg.database_url)
-#   - builtin grafana+prometheus skipped: gpustack/cmd/prerun.py:347 (use_builtin_grafana)
+#   - empty GRAFANA_URL coerced to None: gpustack/config/config.py:278
+#   - use_builtin_grafana True when grafana_url is None: gpustack/cmd/prerun.py
 
 services:
   gpustack-server:
@@ -19,8 +22,9 @@ services:
     environment:
       # --- Shared DB (disables builtin Postgres) ---
       - GPUSTACK_DATABASE_URL=${DB_SCHEME:-mysql}://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
-      # --- Shared observability (disables builtin Prometheus + Grafana) ---
-      - GPUSTACK_DISABLE_BUILTIN_OBSERVABILITY=true
+      # --- Observability ---
+      # GRAFANA_URL empty/unset -> coerced to None -> builtin Grafana+Prometheus run.
+      # GRAFANA_URL set         -> use that shared Grafana, builtin skipped.
       - GPUSTACK_GRAFANA_URL=${GRAFANA_URL}
       - GPUSTACK_GRAFANA_WORKER_DASHBOARD_UID=${GRAFANA_WORKER_DASHBOARD_UID:-gpustack-worker}
       - GPUSTACK_GRAFANA_MODEL_DASHBOARD_UID=${GRAFANA_MODEL_DASHBOARD_UID:-gpustack-model}
@@ -31,8 +35,12 @@ services:
       - gpustack-data:/var/lib/gpustack
     ports:
       - "80:80"
-      # Metrics endpoint your shared Prometheus scrapes (pull model).
+      # Worker metrics endpoint (builtin Prometheus scrapes this).
       - "10161:10161"
+      # Builtin Grafana UI (only serves when GRAFANA_URL unset). Default port 13000.
+      - "13000:13000"
+      # Builtin Prometheus (only serves when GRAFANA_URL unset). Default port 19090.
+      - "19090:19090"
 
 volumes:
   gpustack-data: {}
