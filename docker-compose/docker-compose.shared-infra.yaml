@@ -1,0 +1,38 @@
+# GPUStack as a pure CONSUMER of shared external infra (MySQL, Prometheus, Grafana).
+# No builtin database, no builtin observability — data lives on the remote host,
+# so pruning/recreating this container never loses data.
+#
+# Usage:
+#   cp .env.shared-infra.example .env
+#   # edit .env with your remote host IP + creds
+#   docker compose -f docker-compose.shared-infra.yaml --env-file .env up -d
+#
+# Verify gating in source:
+#   - builtin postgres skipped: gpustack/cmd/prerun.py:87  (if not cfg.database_url)
+#   - builtin grafana+prometheus skipped: gpustack/cmd/prerun.py:347 (use_builtin_grafana)
+
+services:
+  gpustack-server:
+    image: ${IMAGE_REGISTRY:-docker.io}/${IMAGE_NAMESPACE:-gpustack}/gpustack:${GPUSTACK_TAG:-latest}
+    container_name: gpustack-server
+    restart: unless-stopped
+    environment:
+      # --- Shared DB (disables builtin Postgres) ---
+      - GPUSTACK_DATABASE_URL=${DB_SCHEME:-mysql}://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
+      # --- Shared observability (disables builtin Prometheus + Grafana) ---
+      - GPUSTACK_DISABLE_BUILTIN_OBSERVABILITY=true
+      - GPUSTACK_GRAFANA_URL=${GRAFANA_URL}
+      - GPUSTACK_GRAFANA_WORKER_DASHBOARD_UID=${GRAFANA_WORKER_DASHBOARD_UID:-gpustack-worker}
+      - GPUSTACK_GRAFANA_MODEL_DASHBOARD_UID=${GRAFANA_MODEL_DASHBOARD_UID:-gpustack-model}
+      # --- Admin bootstrap (first init only) ---
+      - GPUSTACK_BOOTSTRAP_PASSWORD=${BOOTSTRAP_PASSWORD:-admin}
+    volumes:
+      # Only runtime files / model cache. NOT the database. Safe to prune.
+      - gpustack-data:/var/lib/gpustack
+    ports:
+      - "80:80"
+      # Metrics endpoint your shared Prometheus scrapes (pull model).
+      - "10161:10161"
+
+volumes:
+  gpustack-data: {}

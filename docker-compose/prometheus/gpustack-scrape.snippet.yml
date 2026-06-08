@@ -1,0 +1,14 @@
+# Add these jobs to your SHARED Prometheus config (scrape_configs:).
+# Pull model: your Prometheus scrapes GPUStack's :10161 endpoint.
+# Replace GPUSTACK_HOST with the host running the gpustack container (IP:port).
+
+- job_name: gpustack-server
+  scrape_interval: 10s
+  static_configs:
+    - targets: ['GPUSTACK_HOST:10161']
+
+- job_name: gpustack-worker-discovery
+  scrape_interval: 5s
+  http_sd_configs:
+    - url: 'http://GPUSTACK_HOST:10161/metrics/targets'
+      refresh_interval: 1m
