@@ -1,0 +1,67 @@
+# LOCAL persistence test: MySQL + Grafana as local "infra", GPUStack as consumer.
+# Goal: kill+recreate gpustack-server -> data survives (lives in mysql-data volume).
+#
+#   docker compose -f docker-compose.localtest.yaml up -d
+#   # ... create some data in UI at http://localhost ...
+#   docker compose -f docker-compose.localtest.yaml rm -sf gpustack-server
+#   docker compose -f docker-compose.localtest.yaml up -d gpustack-server
+#   # data still there -> PASS
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: localtest-mysql
+    restart: unless-stopped
+    environment:
+      - MYSQL_ROOT_PASSWORD=rootpass
+      - MYSQL_DATABASE=gpustack
+      - MYSQL_USER=gpustack
+      - MYSQL_PASSWORD=gpustack_pass
+    command: ["--default-authentication-plugin=mysql_native_password"]
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql        # <-- real data lives HERE, survives gpustack recreate
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-prootpass"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: localtest-grafana
+    restart: unless-stopped
+    environment:
+      - GF_SERVER_ROOT_URL=http://localhost:3000
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+
+  gpustack-server:
+    image: ${IMAGE_REGISTRY:-docker.io}/${IMAGE_NAMESPACE:-gpustack}/gpustack:${GPUSTACK_TAG:-latest}
+    container_name: gpustack-server
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      # external DB -> builtin postgres skipped
+      - GPUSTACK_DATABASE_URL=mysql://gpustack:gpustack_pass@mysql:3306/gpustack
+      # external grafana -> builtin grafana+prometheus skipped
+      - GPUSTACK_DISABLE_BUILTIN_OBSERVABILITY=true
+      - GPUSTACK_GRAFANA_URL=http://${HOST_IP:-172.28.77.202}:3000
+      - GPUSTACK_BOOTSTRAP_PASSWORD=admin
+    volumes:
+      - gpustack-data:/var/lib/gpustack   # cache/runtime only - safe to wipe
+    ports:
+      - "80:80"
+      - "10161:10161"
+
+volumes:
+  mysql-data: {}      # persistent DB
+  grafana-data: {}    # persistent dashboards
+  gpustack-data: {}   # disposable cache

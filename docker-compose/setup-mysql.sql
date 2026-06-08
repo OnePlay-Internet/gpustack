@@ -6,7 +6,9 @@ CREATE DATABASE IF NOT EXISTS gpustack CHARACTER SET utf8mb4 COLLATE utf8mb4_uni
 
 -- '%' = allow connections from any host (the GPUStack container's IP).
 -- Tighten to your docker subnet for production, e.g. 'gpustack'@'172.17.%'.
-CREATE USER IF NOT EXISTS 'gpustack'@'%' IDENTIFIED BY 'gpustack_pass';
+-- mysql_native_password: avoids asyncmy + MySQL 8 caching_sha2_password auth failures.
+CREATE USER IF NOT EXISTS 'gpustack'@'%' IDENTIFIED WITH mysql_native_password BY 'gpustack_pass';
+ALTER USER 'gpustack'@'%' IDENTIFIED WITH mysql_native_password BY 'gpustack_pass';
 GRANT ALL PRIVILEGES ON gpustack.* TO 'gpustack'@'%';
 
 FLUSH PRIVILEGES;
